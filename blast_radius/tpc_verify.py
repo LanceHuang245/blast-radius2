@@ -103,11 +103,14 @@ TPC_EST_CPU_MS = {
 # fast_a re-executes queries whose optimized plan changed; cheapest queries run first so broken
 # commits fail fast. Primary budget uses deterministic precompiled s2b_query_ms (identical across
 # all 3 scorer runs); TPC_REEXEC_BUDGET_S is an emergency hard CPU ceiling.
-TPC_REEXEC_MAX_QUERIES = int(os.environ.get("BR_TPC_REEXEC_MAX", "35"))
-TPC_REEXEC_EST_BUDGET_MS = int(os.environ.get("BR_TPC_REEXEC_EST_MS", "4500"))
-TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "12.0"))
-TPC_DUCK_MAX_QUERIES = int(os.environ.get("BR_TPC_DUCK_MAX", "35"))
-TPC_DUCK_BUDGET_S = float(os.environ.get("BR_TPC_DUCK_BUDGET", "8.0"))
+# A proven pass drops test_execute_tpcds (21.5 s, usually the critical worker): a dozen-plus changed
+# plans whose rows all match is still far cheaper than keeping it, and real breakage mostly shows
+# up in the first (cheapest) re-executed queries.
+TPC_REEXEC_MAX_QUERIES = int(os.environ.get("BR_TPC_REEXEC_MAX", "60"))
+TPC_REEXEC_EST_BUDGET_MS = int(os.environ.get("BR_TPC_REEXEC_EST_MS", "9000"))
+TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "16.0"))
+TPC_DUCK_MAX_QUERIES = int(os.environ.get("BR_TPC_DUCK_MAX", "60"))
+TPC_DUCK_BUDGET_S = float(os.environ.get("BR_TPC_DUCK_BUDGET", "10.0"))
 
 _meta_cache: dict | None = None
 _ckpts_meta_cache: dict | None = None
@@ -907,7 +910,7 @@ def verify_tpc_test(
                     if not _same_plan_or_rows(index, q, opt_expr, live=True):
                         return False
 
-            _why(f"{suite_name}: pass ({reexec_count} reexec, {duck_count} duck changed)")
+            _why(f"{suite_name}: pass ({reexec_count} reexec est={reexec_est_ms}ms cpu={reexec_cpu:.2f}s, {duck_count} duck changed)")
             return True
         finally:
             if duck_conn is not None:
