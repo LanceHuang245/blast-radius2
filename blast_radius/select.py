@@ -15,6 +15,7 @@ from blast_radius.patches import FilePatch, apply, change_blocks, parse_patch
 from blast_radius.scopes import (
     COMPOUND_NODES,
     Scopes,
+    _ast_dict_key_tokens,
     _extract_dict_entries,
     _is_docstring,
     canon_ast,
@@ -58,6 +59,13 @@ class Selection:
     non_sqlglot_mask: int = 0
     # Relative fixture path (e.g. "optimizer/simplify.sql") -> changed 0-based pair indices (<=8 pairs).
     fixture_changed_pairs: dict[str, set[int]] | None = None
+    # Phase 2 safe leaf-class tracked-dict entry updates:
+    # (rel_path, cls_qual, attr, removed_key_srcs, set_item_srcs)
+    dict_hot_targets: list[tuple[str, str, str, list[str], list[tuple[str, str]]]] | None = None
+    # Bitmask of tests pulled in by in-place sqlglot/*.py edits.
+    sqlglot_mask: int = 0
+    # Bitmask of tests pulled in by optimizer fixtures with extracted changed pairs.
+    fixture_mapped_mask: int = 0
 
 
 def _decorator_name(node: ast.expr) -> str | None:
@@ -211,17 +219,207 @@ def _extract_attr_hot_targets(
     return targets if targets else None
 
 
+_NO_DICT_HOTPATCH_ATTRS = frozenset({
+    "KEYWORDS",
+    "SINGLE_TOKENS",
+    "TIME_MAPPING",
+    "FORMAT_MAPPING",
+    "INVERSE_TIME_MAPPING",
+    "INVERSE_FORMAT_MAPPING",
+    "CREATABLE_KIND_MAPPING",
+    "UNESCAPED_SEQUENCES",
+    "ESCAPED_SEQUENCES",
+    "IDENTIFIER_ESCAPED_SEQUENCES",
+    "DATE_PART_MAPPING",
+    "JODA_TIME_MAPPING",
+    "INVERSE_JODA_TIME_MAPPING",
+})
+
+
+def _bound_names_in(node: ast.AST) -> set[str]:
+    """Return local names bound by lambda args or comprehension targets."""
+    names: set[str] = set()
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Lambda):
+            args = sub.args
+            for a in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+                names.add(a.arg)
+            if args.vararg:
+                names.add(args.vararg.arg)
+            if args.kwarg:
+                names.add(args.kwarg.arg)
+        elif isinstance(sub, ast.comprehension):
+            for tgt in ast.walk(sub.target):
+                if isinstance(tgt, ast.Name):
+                    names.add(tgt.id)
+    return names
+
+
+def _safe_eval_expr(node: ast.expr, cls_locals: set[str]) -> bool:
+    """True when `node` can be compiled and evaluated directly in the enclosing module's globals."""
+    bound = _bound_names_in(node)
+    for sub in ast.walk(node):
+        if isinstance(sub, (ast.Yield, ast.YieldFrom, ast.Await)):
+            return False
+        if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+            if sub.id not in bound and (
+                sub.id in ("super", "__class__", "locals", "vars") or sub.id in cls_locals
+            ):
+                return False
+    try:
+        compile(ast.unparse(node), "<dict>", "eval")
+    except Exception:
+        return False
+    return True
+
+
+def _explicit_dict_kv(
+    dict_node: ast.Dict,
+) -> tuple[dict[tuple[str, ...], tuple[ast.expr, ast.expr]], list[str]] | None:
+    """Extract explicit `toks -> (key_node, val_node)` entries plus spread dumps from an ast.Dict."""
+    kv: dict[tuple[str, ...], tuple[ast.expr, ast.expr]] = {}
+    spreads: list[str] = []
+    for k, v in zip(dict_node.keys, dict_node.values):
+        if k is None:
+            spreads.append(ast.dump(v))
+            continue
+        toks = _ast_dict_key_tokens(k)
+        if toks is None or toks in kv:
+            return None
+        kv[toks] = (k, v)
+    return kv, spreads
+
+
+def _extract_dict_hot_targets(
+    path: str,
+    module: str,
+    old_scopes: Scopes,
+    new_scopes: Scopes,
+    hunks,
+    impact: ImpactMap,
+) -> list[tuple[str, str, str, list[str], list[tuple[str, str]]]] | None:
+    """Return Phase-2 entry updates if every edit modifies explicit keys of tracked leaf-class dicts."""
+    if not impact.leaf_classes:
+        return None
+    seen_attrs: list[tuple[str, str, ast.stmt, ast.stmt]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for removed, added in change_blocks(hunks):
+        if not removed and not added:
+            continue
+        target_cls = target_attr = None
+        for old_no, _ in removed:
+            info = old_scopes.class_assign_at(old_no)
+            if info is None:
+                return None
+            if target_cls is None:
+                target_cls, target_attr = info[0], info[1]
+            elif (info[0], info[1]) != (target_cls, target_attr):
+                return None
+        for new_no, _anchor, _ in added:
+            info = new_scopes.class_assign_at(new_no)
+            if info is None:
+                return None
+            if target_cls is None:
+                target_cls, target_attr = info[0], info[1]
+            elif (info[0], info[1]) != (target_cls, target_attr):
+                return None
+        if target_cls is None or target_attr is None:
+            return None
+        pair = (target_cls, target_attr)
+        if pair not in seen_keys:
+            old_stmt = old_scopes.class_assigns.get(pair)
+            new_stmt = new_scopes.class_assigns.get(pair)
+            if old_stmt is None or new_stmt is None:
+                return None
+            seen_keys.add(pair)
+            seen_attrs.append((target_cls, target_attr, old_stmt, new_stmt))
+
+    if not seen_attrs:
+        return None
+
+    targets: list[tuple[str, str, str, list[str], list[tuple[str, str]]]] = []
+    for cls_qual, attr, old_stmt, new_stmt in seen_attrs:
+        if cls_qual == "Tokenizer" or cls_qual.endswith(".Tokenizer") or attr in _NO_DICT_HOTPATCH_ATTRS:
+            return None
+        cls_key = f"{module}:{cls_qual}"
+        key_id = f"{cls_key}|{attr}"
+        if (
+            key_id not in impact.tracked_dicts
+            or cls_key not in impact.leaf_classes
+            or cls_key in impact.pre_hook_classes
+            or key_id in impact.collect_attrs
+        ):
+            return None
+        old_val = getattr(old_stmt, "value", None)
+        new_val = getattr(new_stmt, "value", None)
+        if not (isinstance(old_val, ast.Dict) and isinstance(new_val, ast.Dict)):
+            return None
+        old_parsed = _explicit_dict_kv(old_val)
+        new_parsed = _explicit_dict_kv(new_val)
+        if old_parsed is None or new_parsed is None:
+            return None
+        old_kv, old_spreads = old_parsed
+        new_kv, new_spreads = new_parsed
+        if old_spreads != new_spreads:
+            return None
+        if [k for k in old_kv if k in new_kv] != [k for k in new_kv if k in old_kv]:
+            return None
+        removed_toks = [k for k in old_kv if k not in new_kv]
+        added_toks = [k for k in new_kv if k not in old_kv]
+        modified_toks = [
+            k for k in old_kv if k in new_kv and ast.dump(old_kv[k][1]) != ast.dump(new_kv[k][1])
+        ]
+        if not (removed_toks or added_toks or modified_toks):
+            return None
+        touched_tokens = [tok for toks in (removed_toks + added_toks + modified_toks) for tok in toks]
+        if impact.read_at_import(cls_key, attr, touched_tokens):
+            return None
+
+        cls_prefix = cls_qual + "."
+        cls_locals = {a for (cq, a) in new_scopes.class_assigns if cq == cls_qual} | {
+            f[3][len(cls_prefix) :]
+            for f in new_scopes.functions
+            if f[3].startswith(cls_prefix) and "." not in f[3][len(cls_prefix) :]
+        }
+        removed_srcs: list[str] = []
+        for toks in removed_toks:
+            k_node = old_kv[toks][0]
+            if not _safe_eval_expr(k_node, cls_locals):
+                return None
+            removed_srcs.append(ast.unparse(k_node))
+        set_srcs: list[tuple[str, str]] = []
+        for toks in added_toks + modified_toks:
+            k_node, v_node = new_kv[toks]
+            if not (_safe_eval_expr(k_node, cls_locals) and _safe_eval_expr(v_node, cls_locals)):
+                return None
+            set_srcs.append((ast.unparse(k_node), ast.unparse(v_node)))
+        targets.append((path, cls_qual, attr, removed_srcs, set_srcs))
+    return targets if targets else None
+
+
+def _dict_scope_mask(cls_key: str, attr: str, impact: ImpactMap) -> int | None:
+    """All tests that use `cls_key`, reference it, or look up any key of `cls_key|attr`."""
+    mod, cls_qual = cls_key.split(":", 1)
+    cls_usage = impact.class_usage(mod, cls_qual)
+    if cls_usage is None:
+        return None
+    return cls_usage | impact.class_ref_usage(mod, cls_qual) | impact.dict_any_usage(cls_key, attr)
+
+
 def _narrow_added_dict_key(cls_key: str, attr: str, toks: tuple[str, ...], impact: ImpactMap) -> int | None:
-    """Soundly narrow a newly added `exp.<Cls>` key in a tracked class dict, or return None."""
+    """Soundly narrow a newly added key in a tracked class dict, or return None."""
+    scope = _dict_scope_mask(cls_key, attr, impact)
+    if scope is None:
+        return None
     exp_name = next((tok[2:] for tok in toks if tok.startswith("t:")), None)
     if exp_name is None:
-        return None
+        return scope
     if impact.pinned_identifiers and exp_name not in impact.pinned_identifiers:
         return 0
     exp_mask = impact.exp_class_usage(exp_name)
     if exp_mask is None:
-        return None
-    return impact.attr_usage(cls_key, attr) & exp_mask
+        return scope
+    return scope & exp_mask
 
 
 _LINE_SQL_FIXTURES = frozenset(
@@ -265,6 +463,10 @@ def _fixture_pairs(text: str) -> list[tuple[dict[str, str], str, str]] | None:
 
 def _tpc_fixture_inputs(pairs: list[tuple[dict[str, str], str, str]]) -> list[tuple[dict[str, str], str]]:
     return [(m, s) for m, s, _ in pairs]
+
+
+def _fixture_pair_key(pair: tuple[dict[str, str], str, str]) -> tuple:
+    return (tuple(sorted(pair[0].items())), pair[1], pair[2])
 
 
 def _extract_hot_patch_targets(
@@ -398,6 +600,8 @@ class Selector:
             if not files:
                 raise Everything("empty patch")
             mask = 0
+            sqlglot_mask = 0
+            fixture_mapped_mask = 0
             non_sqlglot_mask = 0
             lazy_pp_mask = 0
             all_noop = True
@@ -406,6 +610,7 @@ class Selector:
             hot_targets: list[tuple[str, str]] | None = []
             hot_spans: dict[tuple[str, str], tuple[int, int, bool]] = {}
             attr_targets: list[tuple[str, str, str, object]] | None = []
+            dict_targets: list[tuple[str, str, str, list[str], list[tuple[str, str]]]] | None = []
             self._hit_pp_lazy = False
             self._owner_checks = set()
             self._no_verify = False
@@ -414,23 +619,35 @@ class Selector:
             self._hot_spans_cur: dict[tuple[str, str], tuple[int, int, bool]] = {}
             for file_patch in files:
                 self._hot_spans_cur = {}
-                file_mask, is_noop, is_fixture_or_comment, f_targets, a_targets = self.select_file_detailed(
+                file_mask, is_noop, is_fixture_or_comment, f_targets, a_targets, d_targets = self.select_file_detailed(
                     file_patch, patched_files
                 )
                 mask |= file_mask
-                if not (file_patch.new and file_patch.old == file_patch.new and file_patch.new.startswith("sqlglot/")):
+                if file_patch.new and file_patch.old == file_patch.new and file_patch.new.startswith("sqlglot/"):
+                    sqlglot_mask |= file_mask
+                elif (
+                    file_patch.new
+                    and file_patch.old == file_patch.new
+                    and file_patch.new.startswith("tests/fixtures/")
+                    and file_patch.new[len("tests/fixtures/") :] in self._fixture_changed_pairs
+                ):
+                    fixture_mapped_mask |= file_mask
+                else:
                     non_sqlglot_mask |= file_mask
                 all_noop = all_noop and is_noop
                 all_fixture_or_noop = all_fixture_or_noop and is_fixture_or_comment
-                if f_targets is None and a_targets is None:
+                if f_targets is None and a_targets is None and d_targets is None:
                     hot_targets = None
                     attr_targets = None
+                    dict_targets = None
                 else:
                     if hot_targets is not None and f_targets:
                         hot_targets.extend(f_targets)
                         hot_spans.update(self._hot_spans_cur)
                     if attr_targets is not None and a_targets:
                         attr_targets.extend(a_targets)
+                    if dict_targets is not None and d_targets:
+                        dict_targets.extend(d_targets)
             # The extra passes below re-select with other settings: keep this pass's spans and pairs.
             spans = (
                 [s for s in dict.fromkeys(self._spans) if s[0].startswith("sqlglot/")]
@@ -443,7 +660,7 @@ class Selector:
                 try:
                     mask_no_pp = 0
                     for file_patch in files:
-                        fm, _, _, _, _ = self.select_file_detailed(file_patch, {})
+                        fm, _, _, _, _, _ = self.select_file_detailed(file_patch, {})
                         mask_no_pp |= fm
                     lazy_pp_mask = mask & ~mask_no_pp
                 finally:
@@ -454,7 +671,7 @@ class Selector:
                 self._no_import_check = True
                 try:
                     for file_patch in files:
-                        fm, _, _, _, _ = self.select_file_detailed(file_patch, {})
+                        fm, _, _, _, _, _ = self.select_file_detailed(file_patch, {})
                         coarse_mask |= fm
                 finally:
                     self._no_import_check = False
@@ -477,6 +694,9 @@ class Selector:
                 hot_patch_spans=hot_spans if hot_targets else None,
                 non_sqlglot_mask=non_sqlglot_mask,
                 fixture_changed_pairs=changed_pairs,
+                dict_hot_targets=dict_targets,
+                sqlglot_mask=sqlglot_mask,
+                fixture_mapped_mask=fixture_mapped_mask,
             )
         except Everything as reason:
             return Selection(impact.everything, f"everything ({reason})", {}, None, None, False)
@@ -500,6 +720,7 @@ class Selector:
         bool,
         list[tuple[str, str]] | None,
         list[tuple[str, str, str, object]] | None,
+        list[tuple[str, str, str, list[str], list[tuple[str, str]]]] | None,
     ]:
         impact = self.impact
         is_sqlglot = bool(
@@ -514,7 +735,7 @@ class Selector:
                 mask |= self._readers(p)
                 if p.endswith(".py") and p.startswith(("sqlglot/", "tests/")) and p == fp.old:
                     mask |= impact.module_level(p)
-            return mask, False, False, None, None
+            return mask, False, False, None, None, None
         if (fp.old is not None and fp.new is not None and fp.old != fp.new) or fp.new is None:
             # Deleted or renamed non-binary file: represent deletion as None in patched_files
             # so Phase-1 virtual overlay raises ModuleNotFoundError/FileNotFoundError.
@@ -529,13 +750,13 @@ class Selector:
                 base_text = old_file.read_text(encoding="utf-8") if (old_file and old_file.is_file()) else ""
                 patched_files[fp.new] = apply(base_text, fp.hunks)
                 mask |= self._readers(fp.new)
-            return mask, False, False, None, None
+            return mask, False, False, None, None, None
         path = fp.new
         if fp.old is None:
             # New file: no pinned code imports or opens it; tests that list its folder may see it.
             # The overlay serves it, so verification still works.
             patched_files[path] = apply("", fp.hunks)
-            return self._readers(path), False, False, None, None
+            return self._readers(path), False, False, None, None, None
         if path.startswith("tests/fixtures/"):
             file = SOURCE / path
             if not file.is_file():
@@ -546,7 +767,7 @@ class Selector:
             if path in _LINE_SQL_FIXTURES:
                 # load_sql_fixtures strips `--` comments and blank lines.
                 if _filter_sql_comments(old_text) == _filter_sql_comments(new_text):
-                    return 0, True, True, [], []
+                    return 0, True, True, [], [], []
             elif (path.startswith("tests/fixtures/optimizer/") or path == "tests/fixtures/pretty.sql") and path.endswith(
                 ".sql"
             ):
@@ -555,7 +776,7 @@ class Selector:
                 # load_sql_fixture_pairs strips `--` comments & blank lines and trims around `;`:
                 # pure comment/whitespace fixture edits cannot change any test.
                 if old_pairs is not None and new_pairs is not None and old_pairs == new_pairs:
-                    return 0, True, True, [], []
+                    return 0, True, True, [], [], []
             patched_files[path] = new_text
             if (
                 path.startswith("tests/fixtures/optimizer/")
@@ -563,13 +784,22 @@ class Selector:
                 and path.endswith(".sql")
                 and old_pairs is not None
                 and new_pairs is not None
-                and len(old_pairs) == len(new_pairs)
                 and not self._no_pp_lazy
                 and not self._no_import_check
             ):
-                changed_idx = {idx for idx, (o, n) in enumerate(zip(old_pairs, new_pairs)) if o != n}
-                if 1 <= len(changed_idx) <= 8:
-                    self._fixture_changed_pairs[path[len("tests/fixtures/"):]] = changed_idx
+                if len(old_pairs) == len(new_pairs):
+                    changed_idx = {idx for idx, (o, n) in enumerate(zip(old_pairs, new_pairs)) if o != n}
+                else:
+                    old_key_set = {_fixture_pair_key(p) for p in old_pairs}
+                    changed_idx = {idx for idx, p in enumerate(new_pairs) if _fixture_pair_key(p) not in old_key_set}
+                is_tpc_fix = path in (
+                    "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql",
+                    "tests/fixtures/optimizer/tpc-h/tpc-h.sql",
+                )
+                if 1 <= len(changed_idx) <= 8 or (
+                    len(changed_idx) == 0 and len(new_pairs) > 0 and not is_tpc_fix
+                ):
+                    self._fixture_changed_pairs[path[len("tests/fixtures/") :]] = changed_idx
             fmask = self.select_fixture(path)
             strip_spec = self._tpc_fixture_strip.get(path)
             if strip_spec is not None and old_pairs is not None and new_pairs is not None:
@@ -579,7 +809,7 @@ class Selector:
                 fmask &= ~always_strip
                 if _tpc_fixture_inputs(old_pairs) == _tpc_fixture_inputs(new_pairs):
                     fmask &= ~inputs_unchanged_strip
-            return fmask, False, True, [], []
+            return fmask, False, True, [], [], []
         if path == "pyproject.toml":
             file = SOURCE / path
             if file.is_file():
@@ -597,37 +827,39 @@ class Selector:
                     readers = self._readers(path)
                     if readers:
                         patched_files[path] = new_toml_text
-                    return readers, readers == 0, readers == 0, [], []
+                    return readers, readers == 0, readers == 0, [], [], []
         if path in PYTEST_CONFIG_FILES:
             raise Everything(f"pytest configuration {path}")
         if path.endswith(".py") and path.startswith(("sqlglot/", "tests/")):
             if path.startswith("tests/") and (path.endswith("__init__.py") or path.endswith("conftest.py")):
                 # Package plumbing: a real change reaches every test collected under its folder.
                 saved_spans_ok = self._spans_ok
-                py_mask, py_noop, new_text, _, _ = self.select_python_detailed(path, fp.hunks)
+                py_mask, py_noop, new_text, _, _, _ = self.select_python_detailed(path, fp.hunks)
                 self._spans_ok = saved_spans_ok
                 if py_noop:
-                    return 0, True, True, [], []
+                    return 0, True, True, [], [], []
                 patched_files[path] = new_text
                 folder = path.rsplit("/", 1)[0] + "/"
                 under = sum(1 << i for i, t in enumerate(impact.test_ids) if t.startswith(folder))
-                return under | py_mask, False, False, None, None
+                return under | py_mask, False, False, None, None, None
             if path.startswith("sqlglot/") and path not in impact.lines and path not in impact.importers:
                 # Never imported or run by any test: only tests that open the file can notice.
-                return self._readers(path), self._readers(path) == 0, False, [], []
+                return self._readers(path), self._readers(path) == 0, False, [], [], []
             # Always include tests that directly opened this .py file (e.g. test_typing.py),
             # except when a sqlglot/typing/*.py change is a pure comment or AST-identical noop
             # (test_no_redundant_expression_metadata only inspects AST imports and EXPRESSION_METADATA).
             readers = impact.file_readers(path)
             saved_spans_ok = self._spans_ok
-            py_mask, py_noop, new_text, targets, attr_targets = self.select_python_detailed(path, fp.hunks)
+            py_mask, py_noop, new_text, targets, attr_targets, dict_targets = self.select_python_detailed(
+                path, fp.hunks
+            )
             if not path.startswith("sqlglot/"):
                 self._spans_ok = saved_spans_ok
             if py_noop and path.startswith("sqlglot/typing/"):
                 readers = 0
             if not py_noop or readers:
                 patched_files[path] = new_text
-            return readers | py_mask, py_noop and readers == 0, py_noop, targets, attr_targets
+            return readers | py_mask, py_noop and readers == 0, py_noop, targets, attr_targets, dict_targets
         # Docs, packaging, CI config, the Rust tokenizer (not installed) ...: only tests that
         # open the file or list its folder can notice a change.
         readers = self._readers(path)
@@ -636,7 +868,7 @@ class Selector:
             if not file.is_file():
                 raise Everything(f"no pinned source for {path}")
             patched_files[path] = apply(file.read_text(encoding="utf-8"), fp.hunks)
-        return readers, readers == 0, readers == 0, [], []
+        return readers, readers == 0, readers == 0, [], [], []
 
     def _readers(self, path: str) -> int:
         """Tests that opened the file or listed its folder in the pinned run."""
@@ -663,13 +895,14 @@ class Selector:
         str,
         list[tuple[str, str]] | None,
         list[tuple[str, str, str, object]] | None,
+        list[tuple[str, str, str, list[str], list[tuple[str, str]]]] | None,
     ]:
         old_text, old_scopes = self.old_source(path)
         new_text = apply(old_text, hunks)
 
         changed = [line[1:] for _, _, _, body in hunks for line in body if line[0] in "+-"]
         if comment_lines_only(changed) and same_code(old_text, new_text):
-            return 0, True, new_text, [], []
+            return 0, True, new_text, [], [], []
         try:
             new_tree = ast.parse(new_text)
             compile(new_tree, path, "exec", dont_inherit=True)
@@ -680,7 +913,7 @@ class Selector:
             mask = self.impact.module_level(path)
             if path.startswith("sqlglot/"):
                 mask |= self.docs_mask
-            return mask, False, new_text, None, None
+            return mask, False, new_text, None, None, None
         new_scopes = Scopes(new_tree, has_lambda="lambda" in new_text)
 
         # Normalized AST equivalence catches quote/paren/wrapping refactors, TYPE_CHECKING-only
@@ -702,7 +935,7 @@ class Selector:
             old_lines=changed_old_lines,
             new_lines=changed_new_lines,
         ):
-            return 0, True, new_text, [], []
+            return 0, True, new_text, [], [], []
 
         module = module_name(path)
         mask = 0
@@ -736,6 +969,7 @@ class Selector:
 
         targets: list[tuple[str, str]] | None = None
         attr_targets: list[tuple[str, str, str, object]] | None = None
+        dict_targets: list[tuple[str, str, str, list[str], list[tuple[str, str]]]] | None = None
         if path.startswith("sqlglot/"):
             # Every block resolved per statement means no edited statement ran before the tests, or
             # only in imports whose built state the runtime proves unchanged: either way, swapping
@@ -747,11 +981,15 @@ class Selector:
                 self._hot_spans_cur.update(hspans)
             else:
                 attr_targets = _extract_attr_hot_targets(path, module, old_scopes, new_scopes, hunks, self.impact)
+                if attr_targets is None:
+                    dict_targets = _extract_dict_hot_targets(
+                        path, module, old_scopes, new_scopes, hunks, self.impact
+                    )
         else:
             # Non-sqlglot .py edits (e.g. tests/*.py) are forced to Phase 1 in verify.py; keeping
             # empty lists here preserves sqlglot/ hot_patch_targets for fast_a and tokenizer checks.
-            targets, attr_targets = [], []
-        return mask, False, new_text, targets, attr_targets
+            targets, attr_targets, dict_targets = [], [], []
+        return mask, False, new_text, targets, attr_targets, dict_targets
 
     def select_block(
         self,
@@ -778,9 +1016,8 @@ class Selector:
                 return t_mask
 
         # Try fine-grained class dict-key or class attribute tracking first.
-        attr_mask = self.class_attr_level(path, module, old_scopes, new_scopes, removed, added)
+        attr_mask = self.class_attr_level(path, module, old_scopes, new_scopes, removed, added, ignore_ann)
         if attr_mask is not None:
-            self._spans_ok = False
             return attr_mask | self._test_file_own_mask(path, old_scopes, new_scopes, removed, added)
 
         # One-for-one edit of statements inside one function: the tests that ran them.
@@ -886,7 +1123,7 @@ class Selector:
                     mask |= impact.dict_key_usage(cls_key, "EXPRESSION_METADATA", tok)
         return mask
 
-    def class_attr_level(self, path, module, old_scopes: Scopes, new_scopes: Scopes, removed, added) -> int | None:
+    def class_attr_level(self, path, module, old_scopes: Scopes, new_scopes: Scopes, removed, added, ignore_ann: bool = False) -> int | None:
         """Resolve an edit confined to one direct class-body attribute assignment."""
         impact = self.impact
         if not removed and not added:
@@ -970,6 +1207,22 @@ class Selector:
                         changed_tokens = [tok for toks in changed_keys for tok in toks]
                         if changed_tokens and impact.read_at_import(cls_key, attr, changed_tokens):
                             return None
+                        if attr == "TRANSFORMS" and cls_key in impact.pre_hook_classes:
+                            return None
+                        collect_lines = impact.collect_lines.get(path, ())
+
+                        def _is_lambda_body_edit(toks: tuple[str, ...]) -> bool:
+                            old_e = old_entries.get(toks)
+                            new_e = new_entries.get(toks)
+                            return (
+                                isinstance(old_e, ast.Lambda)
+                                and isinstance(new_e, ast.Lambda)
+                                and canon_ast(old_e.args, ignore_ann) == canon_ast(new_e.args, ignore_ann)
+                                and not any(
+                                    old_e.body.lineno <= ln <= old_e.body.end_lineno for ln in collect_lines
+                                )
+                            )
+
                         mask = impact.dict_key_usage(cls_key, attr, "*")
                         if added_keys:
                             added_tokens = [tok for toks in added_keys for tok in toks]
@@ -981,13 +1234,38 @@ class Selector:
                                     return None
                                 mask |= narrowed
                         for toks in changed_keys:
-                            for tok in toks:
-                                mask |= impact.dict_key_usage(cls_key, attr, tok)
+                            if attr == "TRANSFORMS":
+                                # Generator.__init__ caches cls.TRANSFORMS into _DISPATCH_CACHE once per class,
+                                # so dict_key_usage only credits the first test; use lambda body lines or scope+exp.
+                                if _is_lambda_body_edit(toks):
+                                    body = old_entries[toks].body
+                                    mask |= impact.span(path, body.lineno, body.end_lineno)
+                                else:
+                                    narrowed = _narrow_added_dict_key(cls_key, attr, toks, impact)
+                                    if narrowed is None:
+                                        return None
+                                    mask |= narrowed
+                            else:
+                                for tok in toks:
+                                    mask |= impact.dict_key_usage(cls_key, attr, tok)
+                        lambda_spans_only = (
+                            not added_keys
+                            and same_order
+                            and bool(changed_keys)
+                            and all(_is_lambda_body_edit(toks) for toks in changed_keys)
+                        )
+                        if lambda_spans_only:
+                            for toks in changed_keys:
+                                body = old_entries[toks].body
+                                self._spans.append((path, body.lineno, body.end_lineno))
+                        else:
+                            self._spans_ok = False
                         return mask
             return None
 
         # Case 2: Non-dict class data attribute not read at import/metaclass time.
         if key_id in impact.tracked_attrs and not impact.read_at_import(cls_key, attr):
+            self._spans_ok = False
             return impact.attr_usage(cls_key, attr)
 
         return None
@@ -1182,10 +1460,28 @@ class Selector:
             sub_pairs = _matching_compound_subblocks(so, sn, ignore_ann)
             if sub_pairs is not None:
                 mask = 0
-                for bo, bn in sub_pairs:
+                collect_lines = self.impact.collect_lines.get(path, ())
+                for idx, (bo, bn) in enumerate(sub_pairs):
                     sub_mask = self._diff_stmt_lists(path, bo, bn, ignore_ann)
                     if sub_mask is None:
-                        return self._test_time_span(path, so.lineno, so.end_lineno)
+                        if (
+                            isinstance(so, (ast.If, ast.While))
+                            and self.values is not None
+                            and path.startswith("sqlglot/")
+                        ):
+                            hstop = header_end(so)
+                            if not any(so.lineno <= ln <= hstop for ln in collect_lines):
+                                try:
+                                    vmask = self.values.narrow_branch(
+                                        path, so.test, idx == 0, so, self.impact, header_stop=hstop
+                                    )
+                                except Exception:
+                                    vmask = None
+                                if vmask is not None:
+                                    self._spans.append((path, so.lineno, hstop))
+                                    sub_mask = vmask & self.impact.span(path, so.lineno, hstop)
+                        if sub_mask is None:
+                            return self._test_time_span(path, so.lineno, so.end_lineno)
                     mask |= sub_mask
                 return mask
             # Only the compound header changed while all sub-blocks are identical.

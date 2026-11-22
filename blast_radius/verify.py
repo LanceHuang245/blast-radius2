@@ -481,6 +481,46 @@ def _apply_attr_hotpatch(targets: list[tuple[str, str, str, object]]) -> bool:
     return True
 
 
+def _apply_dict_hotpatch(
+    targets: list[tuple[str, str, str, list[str], list[tuple[str, str]]]],
+) -> bool:
+    """Update non-import-time tracked dict entries on leaf classes in-place inside Phase-2 child."""
+    for rel_path, cls_qual, attr_name, removed_keys, set_items in targets:
+        mod = importlib.import_module(module_name(rel_path))
+        container: object = mod
+        for part in cls_qual.split("."):
+            container = container.__dict__.get(part) if hasattr(container, "__dict__") else None
+            if container is None:
+                return False
+        if not isinstance(container, type) or any(
+            s.__module__.startswith("sqlglot") for s in container.__subclasses__()
+        ):
+            return False
+        cur = container.__dict__.get(attr_name)
+        if not isinstance(cur, dict):
+            return False
+        new_d = dict(cur)
+        filename = str((Path(os.getcwd()) / rel_path).resolve())
+        try:
+            for k_src in removed_keys:
+                k = eval(compile(k_src, filename, "eval"), mod.__dict__)
+                if k not in new_d:
+                    return False
+                del new_d[k]
+            for k_src, v_src in set_items:
+                k = eval(compile(k_src, filename, "eval"), mod.__dict__)
+                v = eval(compile(v_src, filename, "eval"), mod.__dict__)
+                new_d[k] = v
+        except Exception:
+            return False
+        setattr(container, attr_name, new_d)
+        if attr_name == "TRANSFORMS":
+            gen_mod = sys.modules.get("sqlglot.generator")
+            if gen_mod is not None and hasattr(gen_mod, "_DISPATCH_CACHE"):
+                gen_mod._DISPATCH_CACHE.pop(container, None)
+    return True
+
+
 def _install_lazy_executor_setup(cls: type) -> None:
     """Defer TestExecutor's heavy TPC-H/TPC-DS CSV + DuckDB setup until actually accessed."""
     orig_cm = cls.__dict__.get("setUpClass")
@@ -999,6 +1039,11 @@ def _start_child_verification(
                     os.write(w_fd, b"FAIL_PATCH")
                     os.close(w_fd)
                     os._exit(0)
+            if task.selection.dict_hot_targets:
+                if not _apply_dict_hotpatch(task.selection.dict_hot_targets):
+                    os.write(w_fd, b"FAIL_PATCH")
+                    os.close(w_fd)
+                    os._exit(0)
 
         def _alarm_handler(_signum, _frame):
             raise TimeoutError("test timed out")
@@ -1281,6 +1326,18 @@ def _start_child_verification(
 
         # Step 2c: the tail, as the best ROI prefix of what is still unverified, re-planned after
         # each failure with adaptive throttling and a deterministic estimated CPU cap.
+        blocked_decap = (
+            {
+                n
+                for n in decap_set
+                if failed
+                and id_by_number[n] in TPC_SUITE_BY_TEST_ID
+                and TPC_SUITE_BY_TEST_ID[id_by_number[n]] != "tpch"
+                and task.tpc_mode != "fast_a"
+            }
+            if decap_set
+            else set()
+        )
         fix_narrow_only = sel.fixture_only and not VERIFY_FIXTURE_MAX_MS
         if not fix_narrow_only or (sel.fixture_changed_pairs and task.case_filter):
             per_mod_ms = 20 if task.phase == 1 else 4
@@ -1294,7 +1351,7 @@ def _start_child_verification(
                 if s2c_failed >= 2 and not s2c_passed:
                     break
                 cur_roi = 2.5 if (s2c_failed >= 2 and s2c_failed >= s2c_passed) else MIN_ROI_RATIO
-                s2c_cands = verifiable - passed - failed - decap_set
+                s2c_cands = verifiable - passed - failed - blocked_decap
                 if fix_narrow_only:
                     s2c_cands = {n for n in s2c_cands if n in task.case_filter and len(task.case_filter[n]) <= 8}
                 batch = _best_drop_prefix(
@@ -1321,37 +1378,70 @@ def _start_child_verification(
                         break
                 if batch_ok:
                     break
-            # When the commit has 0 failures so far (>=2 passes) and verifying the remaining tail
-            # would empty the commit completely (dropping the 2.0s last-worker startup), accept a
-            # lower marginal ROI (>=1.15) with a tight 2.5s est CPU cap, stopping on first failure.
+            # When the commit has 0 failures so far (>=2 passes), unlock dynamic 0-fail tail
+            # clearing (full empty drops the 2.0s last-worker startup) and worker collapsing.
             if not failed and len(passed) >= 2 and time.process_time() - step2c_t0 <= 12.0:
                 rem_tail = {
                     n
                     for n in (verifiable - passed)
-                    if id_by_number[n] not in TPC_SUITE_BY_TEST_ID and id_by_number[n] != MAX_NODES_TEST_ID
+                    if (
+                        id_by_number[n] not in TPC_SUITE_BY_TEST_ID
+                        or (task.tpc_mode is not None and TPC_SUITE_BY_TEST_ID[id_by_number[n]] == "tpch")
+                    )
+                    and id_by_number[n] != MAX_NODES_TEST_ID
                 }
                 if fix_narrow_only:
                     rem_tail = {n for n in rem_tail if n in task.case_filter and len(task.case_filter[n]) <= 8}
                 cur_pool = task.chosen - passed
-                if rem_tail and cur_pool <= rem_tail:
-                    rem_cpu = (
-                        sum(cpu_by_number[n] for n in rem_tail)
-                        + len({id_by_number[n].split("::", 1)[0] for n in rem_tail}) * per_mod_ms
-                    )
+                if rem_tail:
                     cur_cost, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
-                    if (
-                        rem_cpu <= 2500
-                        and step2c_est_ms + rem_cpu <= 6500
-                        and cur_cost >= rem_cpu * 1.15
-                        and cur_cost - rem_cpu >= MIN_GAIN_MS
-                    ):
-                        tail_ordered = sorted(
-                            rem_tail,
-                            key=lambda n: (cpu_by_number[n], ms_by_number[n], id_by_number[n]),
+                    ran_full_clear = False
+                    if cur_pool <= rem_tail:
+                        rem_cpu = (
+                            sum(cpu_by_number[n] for n in rem_tail)
+                            + len({id_by_number[n].split("::", 1)[0] for n in rem_tail}) * per_mod_ms
                         )
-                        for num in tail_ordered:
-                            if not _mark(num, _run_candidate(num)):
-                                break
+                        if (
+                            rem_cpu <= min(6500, int(cur_cost * 0.72))
+                            and step2c_est_ms + rem_cpu <= 9000
+                            and cur_cost >= rem_cpu * 1.15
+                            and cur_cost - rem_cpu >= MIN_GAIN_MS
+                        ):
+                            ran_full_clear = True
+                            tail_ordered = sorted(
+                                rem_tail,
+                                key=lambda n: (cpu_by_number[n], ms_by_number[n], id_by_number[n]),
+                            )
+                            for num in tail_ordered:
+                                if not _mark(num, _run_candidate(num)):
+                                    break
+                    if not ran_full_clear and not failed:
+                        batch = _best_drop_prefix(
+                            cur_pool,
+                            rem_tail,
+                            ms_by_number,
+                            cpu_by_number,
+                            MIN_GAIN_MS,
+                            id_by_number=id_by_number,
+                            per_mod_ms=per_mod_ms,
+                            min_roi=1.18,
+                        )
+                        if batch:
+                            batch_cpu = (
+                                sum(cpu_by_number[n] for n in batch)
+                                + len({id_by_number[n].split("::", 1)[0] for n in batch}) * per_mod_ms
+                            )
+                            if (
+                                batch_cpu <= min(4500, int(cur_cost * 0.65))
+                                and step2c_est_ms + batch_cpu <= 8500
+                            ):
+                                tail_ordered = sorted(
+                                    batch,
+                                    key=lambda n: (cpu_by_number[n], ms_by_number[n], id_by_number[n]),
+                                )
+                                for num in tail_ordered:
+                                    if not _mark(num, _run_candidate(num)):
+                                        break
     except BaseException:
         pass
     finally:
@@ -1369,6 +1459,20 @@ def _budget_scale(n_commits: int) -> float:
 
 
 _CASE_MAP: dict | None = None
+
+
+def _decode_mask(mask: int, number_by_index: list[int | None] | None) -> set[int]:
+    out: set[int] = set()
+    if not mask or number_by_index is None:
+        return out
+    m = mask
+    while m:
+        lsb = m & -m
+        n = number_by_index[lsb.bit_length() - 1]
+        if n is not None:
+            out.add(n)
+        m ^= lsb
+    return out
 
 
 def _case_plan(
@@ -1396,15 +1500,9 @@ def _case_plan(
     tpc_s2b_query_mask: dict[int, int] = {}
     cpu_override: dict[int, int] = {}
 
-    non_sg_nums: set[int] = set()
-    if sel.non_sqlglot_mask and number_by_index is not None:
-        m = sel.non_sqlglot_mask
-        while m:
-            lsb = m & -m
-            n = number_by_index[lsb.bit_length() - 1]
-            if n is not None:
-                non_sg_nums.add(n)
-            m ^= lsb
+    non_sg_nums = _decode_mask(sel.non_sqlglot_mask, number_by_index)
+    fix_mapped_nums = _decode_mask(sel.fixture_mapped_mask, number_by_index)
+    sg_nums = _decode_mask(sel.sqlglot_mask, number_by_index)
 
     if sel.edited_spans is not None:
         if _CASE_MAP is None:
@@ -1418,13 +1516,32 @@ def _case_plan(
             entry = _CASE_MAP.get(tid)
             if entry is None:
                 continue
+            kind = entry.get("kind", "check_file")
+            if num in fix_mapped_nums and kind != "check_file":
+                continue
             mask = 0
             for path, first, last in sel.edited_spans:
                 per_line = entry["lines"].get(path)
                 if per_line:
                     for line in range(first, last + 1):
                         mask |= per_line.get(line, 0)
-            kind = entry.get("kind", "check_file")
+            if kind == "check_file" and num in fix_mapped_nums:
+                if num in sg_nums and mask == 0:
+                    continue
+                cases = entry["cases"]
+                sg_matched = {tuple(cases[k]) for k in range(len(cases)) if mask >> k & 1} if num in sg_nums else set()
+                entry_fks = {fk for fk, _ in cases}
+                changed_pairs = sel.fixture_changed_pairs or {}
+                fix_matched = {
+                    (fk, idx) for fk in entry_fks if fk in changed_pairs for idx in changed_pairs[fk]
+                }
+                union = sg_matched | fix_matched
+                if len(union) < len(cases) and (
+                    union or (num not in sg_nums and any(fk in changed_pairs for fk in entry_fks))
+                ):
+                    case_filter[num] = union
+                    cpu_override[num] = max(25, base_cpu[num] * (len(union) + 1) // (len(cases) + 1) + 15)
+                continue
             if kind == "tpc_stage1":
                 if mask:
                     tpc_query_mask[num] = mask
@@ -1500,12 +1617,15 @@ def _case_plan(
                 if entry is None or entry.get("kind") != "check_file":
                     continue
                 cases = entry["cases"]
+                entry_fks = {fk for fk, _ in cases}
+                has_fk = any(fk in sel.fixture_changed_pairs for fk in entry_fks)
                 matched = {
                     (fk, idx)
-                    for fk, idx in cases
-                    if fk in sel.fixture_changed_pairs and idx in sel.fixture_changed_pairs[fk]
+                    for fk in entry_fks
+                    if fk in sel.fixture_changed_pairs
+                    for idx in sel.fixture_changed_pairs[fk]
                 }
-                if matched and len(matched) < len(cases):
+                if has_fk and len(matched) < len(cases):
                     case_filter[num] = matched
                     cpu_override[num] = max(25, base_cpu[num] * len(matched) // max(len(cases), 1) + 15)
 
@@ -1554,7 +1674,7 @@ def plan_verification(
             tpc_s2b_query_mask,
             cpu_override,
         ) = _case_plan(chosen, sel, id_by_number, base_cpu, number_by_index=number_by_index)
-        cpu_by_number = {**base_cpu, **cpu_override} if cpu_override else base_cpu
+        cpu_by_number = {**base_cpu, **cpu_override} if cpu_override else dict(base_cpu)
         tids = [id_by_number[n] for n in chosen]
         verifiable = {
             n
@@ -1609,6 +1729,14 @@ def plan_verification(
                     for n in tpc_nums
                 ):
                     tpc_mode = None
+
+        for num in verifiable:
+            sp = _special_cpu_ms(num, id_by_number[num], sel, tpc_mode, tpc_query_mask, tpc_s2b_query_mask)
+            if sp is not None:
+                scaled_sp = round(sp * SPECIAL_CPU_SCALE)
+                if scaled_sp < cpu_by_number[num]:
+                    cpu_override[num] = scaled_sp
+                    cpu_by_number[num] = scaled_sp
 
         rem_verifiable = verifiable - lazy_pp_nums
 
@@ -1781,6 +1909,8 @@ def _prewarm_for_phase2(
         for rel_path, _ in task.selection.hot_patch_targets or ():
             needed_mods.add(module_name(rel_path))
         for rel_path, _, _, _ in task.selection.attr_hot_targets or ():
+            needed_mods.add(module_name(rel_path))
+        for rel_path, *_ in task.selection.dict_hot_targets or ():
             needed_mods.add(module_name(rel_path))
         verifiable = [n for n in task.chosen if id_by_number[n] not in SUBPROCESS_TESTS]
         if not verifiable:

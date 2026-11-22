@@ -53,10 +53,17 @@ def main() -> None:
             # digest check costs ~0.25s and preserves Phase-2 + per-case edited_spans filtering.
             narrow_cost = _mask_cost_ms(sel.mask)
             coarse_cost = narrow_cost if sel.coarse_mask == sel.mask else _mask_cost_ms(sel.coarse_mask)
-            worth_check = (coarse_cost - narrow_cost >= 650) or (
-                coarse_cost >= 3500
-                and coarse_cost - narrow_cost >= 400
-                and (sel.hot_patch_targets is not None or sel.edited_spans is not None)
+            worth_check = (
+                (coarse_cost - narrow_cost >= 650)
+                or (
+                    coarse_cost >= 3500
+                    and coarse_cost - narrow_cost >= 400
+                    and (sel.hot_patch_targets is not None or sel.edited_spans is not None)
+                )
+                or (
+                    coarse_cost >= 5000
+                    and (bool(sel.hot_patch_targets) or bool(sel.edited_spans))
+                )
             )
             if worth_check and os.environ.get("BR_VERIFY", "1") != "0":
                 from blast_radius.verify import check_import_state
@@ -70,7 +77,12 @@ def main() -> None:
                 sel.mask, sel.lazy_pp_mask = sel.coarse_mask, 0
                 # Import-time state differs: a pre-warmed import would be stale, and the
                 # changes reach tests beyond the edited statements.
-                sel.hot_patch_targets, sel.attr_hot_targets, sel.edited_spans = None, None, None
+                sel.hot_patch_targets, sel.attr_hot_targets, sel.dict_hot_targets, sel.edited_spans = (
+                    None,
+                    None,
+                    None,
+                    None,
+                )
         chosen = {numbers[i] for i in range(len(numbers)) if sel.mask >> i & 1 and numbers[i] is not None}
         if unmapped and sel.reason != "noop":
             chosen.update(unmapped)

@@ -285,32 +285,76 @@ def _calibrate_and_update_tpc_meta(src: Path, all_test_ids: list[str]) -> dict[s
     for tid in all_test_ids:
         if tid in seen_cal or tid in skip_ids:
             continue
-        if tid.startswith(("tests/test_optimizer.py::", "tests/dialects/test_")) and tid.count("::") == 2:
+        if tid.count("::") == 2 and not tid.startswith("tests/test_dialect_imports.py::"):
             to_calibrate.append(tid)
             seen_cal.add(tid)
 
     real_cpu_ms: dict[str, int] = {}
-    loaded: dict[tuple[str, str], type] = {}
+    loaded: dict[tuple[str, str], type | None] = {}
     for tid in to_calibrate:
         file_path, cls_name, meth_name = tid.split("::")
         mod_name = file_path[:-3].replace("/", ".")
         key = (mod_name, cls_name)
         if key not in loaded:
-            mod = importlib.import_module(mod_name)
-            if hasattr(mod, "ProcessPoolExecutor"):
-                setattr(mod, "ProcessPoolExecutor", _SyncExec)
-            cls = getattr(mod, cls_name)
-            if cls_name != "TestExecutor":
-                cls.setUpClass()
-            loaded[key] = cls
+            try:
+                mod = importlib.import_module(mod_name)
+                if hasattr(mod, "ProcessPoolExecutor"):
+                    setattr(mod, "ProcessPoolExecutor", _SyncExec)
+                cls = getattr(mod, cls_name)
+                if cls_name != "TestExecutor":
+                    cls.setUpClass()
+                loaded[key] = cls
+            except Exception:
+                loaded[key] = None
         cls = loaded[key]
-        t0 = time.process_time()
-        res = unittest.TestResult()
-        cls(meth_name).run(res)
-        dt_ms = max(1, round((time.process_time() - t0) * 1000))
-        if res.wasSuccessful():
-            real_cpu_ms[tid] = dt_ms
+        if cls is None:
+            continue
+        try:
+            t0 = time.process_time()
+            res = unittest.TestResult()
+            cls(meth_name).run(res)
+            dt_ms = max(1, round((time.process_time() - t0) * 1000))
+            if res.wasSuccessful():
+                real_cpu_ms[tid] = dt_ms
+        except Exception:
+            continue
     return real_cpu_ms
+
+
+def _leaf_sqlglot_classes() -> list[str]:
+    """Return sqlglot Dialect/Tokenizer/Parser/Generator classes with zero sqlglot subclasses."""
+    import pkgutil
+
+    os.chdir(SOURCE)
+    if str(SOURCE) not in sys.path:
+        sys.path.insert(0, str(SOURCE))
+    import sqlglot
+    from sqlglot import generator, parser, tokens
+    from sqlglot.dialects import dialect
+
+    for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+        if info.name != "sqlglot.__main__":
+            try:
+                importlib.import_module(info.name)
+            except Exception:
+                pass
+
+    seen: set[type] = set()
+    stack: list[type] = [dialect.Dialect, tokens.Tokenizer, parser.Parser, generator.Generator]
+    while stack:
+        cls = stack.pop()
+        if cls in seen:
+            continue
+        seen.add(cls)
+        stack.extend(cls.__subclasses__())
+    return sorted(
+        {
+            f"{c.__module__}:{c.__qualname__}"
+            for c in seen
+            if c.__module__.startswith("sqlglot")
+            and not any(s.__module__.startswith("sqlglot") for s in c.__subclasses__())
+        }
+    )
 
 
 def main() -> None:
@@ -346,10 +390,15 @@ def main() -> None:
     raw["import_value_attrs"] = [a for a in raw.get("import_value_attrs", []) if a != "EXPRESSION_METADATA"]
     raw["typing_dialects"] = typing_dialects
     raw["pinned_identifiers"] = sorted(pinned_ids)
+    raw["leaf_classes"] = _leaf_sqlglot_classes()
     cal = _calibrate_and_update_tpc_meta(SOURCE, raw["tests"])
     cal["tests/test_generator.py::TestGenerator::test_generator_memory"] = 18400
     cal["tests/dialects/test_dialect.py::TestDialect::test_lazy_load"] = 5
     raw["real_cpu_ms"] = cal
+
+    dict_any: dict[str, int] = defaultdict(int)
+    for k, idx in raw.get("dict_keys", {}).items():
+        dict_any[k.rsplit("|", 1)[0]] |= old_masks[idx]
 
     seen: dict[int, int] = {m: i for i, m in enumerate(old_masks)}
     sets_bytes: list[bytes] = [
@@ -366,6 +415,7 @@ def main() -> None:
 
     raw["class_refs"] = {c: intern(m) for c, m in sorted(scoped_refs.items()) if m}
     raw["exp_usage"] = {c: intern(m) for c, m in sorted(exp_usage.items())}
+    raw["dict_usage"] = {k: intern(m) for k, m in sorted(dict_any.items()) if m}
     raw["sets"] = sets_bytes
     raw["sets_binary"] = True
 
@@ -377,6 +427,7 @@ def main() -> None:
         f"{len(raw['class_refs'])} scoped class_refs, "
         f"{len(raw['typing_dialects'])} typing dialects, "
         f"{len(raw['real_cpu_ms'])} calibrated tests, "
+        f"{len(raw['leaf_classes'])} leaf classes, "
         f"{out_path.stat().st_size / 1e6:.2f} MB",
         file=sys.stderr,
     )

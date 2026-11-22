@@ -43,6 +43,8 @@ class ImpactMap:
         self.pinned_identifiers: set[str] = set(raw.get("pinned_identifiers", []))
         self.exp_usage: dict[str, int] = raw.get("exp_usage", {})
         self.real_cpu_ms: dict[str, int] = raw.get("real_cpu_ms", {})
+        self.leaf_classes: set[str] = set(raw.get("leaf_classes", []))
+        self.dict_usage: dict[str, int] = raw.get("dict_usage", {})
         self.everything = (1 << len(self.test_ids)) - 1
 
         self.by_file: dict[str, int] = {}
@@ -109,6 +111,19 @@ class ImpactMap:
     def dict_key_usage(self, cls_key: str, attr: str, key_tok: str) -> int:
         index = self.dict_keys.get(f"{cls_key}|{attr}|{key_tok}")
         return 0 if index is None else self.mask(index)
+
+    def dict_any_usage(self, cls_key: str, attr: str) -> int:
+        """Tests that accessed any key (or '*') of `cls_key|attr`."""
+        key = f"{cls_key}|{attr}"
+        index = self.dict_usage.get(key)
+        if index is not None:
+            return self.mask(index)
+        prefix = key + "|"
+        mask = 0
+        for k, idx in self.dict_keys.items():
+            if k.startswith(prefix):
+                mask |= self.mask(idx)
+        return mask
 
     def attr_usage(self, cls_key: str, attr: str) -> int:
         index = self.attrs.get(f"{cls_key}|{attr}")

@@ -101,6 +101,34 @@ class ValueMap:
             return None
         return self._eval_mutations(path, muts, impact)
 
+    def narrow_branch(
+        self,
+        path: str,
+        test_node: ast.expr,
+        need_truth: bool,
+        stmt_node: ast.AST,
+        impact,
+        header_stop: int | None = None,
+    ) -> int | None:
+        """Keep only tests where unchanged logic condition `test_node` ever took truth value `need_truth`."""
+        if not vs.is_logic(test_node):
+            return None
+        _, atoms_t, _ = vs.build(test_node)
+        if not vs.instrumentable(atoms_t):
+            return None
+        res = _narrow_ifexp_mut(
+            test_node,
+            need_truth,
+            self.files.get(path, {}),
+            self.imports.get(path, {}),
+        )
+        if res is None:
+            return None
+        m_acc, m_rec = res
+        stop = header_stop if header_stop is not None else stmt_node.end_lineno
+        extra = impact.span(path, stmt_node.lineno, stop) & ~self._mask(m_rec)
+        return self._mask(m_acc) | extra
+
 
 def _dump(node: ast.AST) -> str:
     return ast.dump(node, annotate_fields=False)

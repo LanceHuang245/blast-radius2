@@ -453,7 +453,7 @@ def select_tpc_mode(sel: Selection) -> str | None:
 
     # Function-body-only edits inside sqlglot/: if zero edited functions execute in Stage 2b,
     # Stage-1/2a bit-for-bit output parity proves Stage 2b receives identical inputs and code.
-    if sel.hot_patch_targets and not sel.attr_hot_targets and tpc_safe_all:
+    if sel.hot_patch_targets and not sel.attr_hot_targets and not sel.dict_hot_targets and tpc_safe_all:
         edited_pairs = {(rel_path, qual.rsplit(".", 1)[-1]) for rel_path, qual in sel.hot_patch_targets}
         touches_s1 = any(pair in meta["stage1_funcs"] for pair in edited_pairs)
         touches_s2b = any(pair in meta["stage2b_funcs"] for pair in edited_pairs)
