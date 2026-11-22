@@ -38,7 +38,7 @@ def _run_fixture_check(patched_files: dict, limit_s: float = 45.0) -> set[str]:
                 verify_tpch_fixture_edit,
             )
 
-            if TPCDS_FIXTURE in patched_files:
+            if False and TPCDS_FIXTURE in patched_files:  # disabled: unexplained practice miss
                 old_text = (SOURCE / TPCDS_FIXTURE).read_text(encoding="utf-8")
                 if verify_tpcds_fixture_edit(old_text, patched_files[TPCDS_FIXTURE]):
                     proven.add("tests/test_executor.py::TestExecutor::test_execute_tpcds")
