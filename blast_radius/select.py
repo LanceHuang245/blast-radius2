@@ -589,7 +589,7 @@ class Selector:
             if not file.is_file():
                 raise Everything(f"no pinned source for {path}")
             text = file.read_text(encoding="utf-8")
-            self._old[path] = (text, Scopes(ast.parse(text), has_lambda="lambda" in text))
+            self._old[path] = (text, Scopes(ast.parse(text), has_lambda="lambda" in text, text=text))
         return self._old[path]
 
     def select(self, patch_text: str) -> tuple[int, str]:
@@ -923,7 +923,7 @@ class Selector:
             if path.startswith("sqlglot/"):
                 mask |= self.docs_mask
             return mask, False, new_text, None, None, None
-        new_scopes = Scopes(new_tree, has_lambda="lambda" in new_text)
+        new_scopes = Scopes(new_tree, has_lambda="lambda" in new_text, text=new_text)
 
         # Normalized AST equivalence catches quote/paren/wrapping refactors, TYPE_CHECKING-only
         # edits, and pure type-annotation edits when `from __future__ import annotations` holds.

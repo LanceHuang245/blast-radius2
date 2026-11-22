@@ -80,6 +80,8 @@ DECAP_CPU_RATIO = float(os.environ.get("BR_DECAP_CPU_RATIO", "0.75"))
 # Weight of a CPU millisecond against a simulated millisecond when choosing what to verify
 # (1.0: break-even on the score; below 1: spend CPU to cut simulated time further).
 CPU_WEIGHT = float(os.environ.get("BR_CPU_WEIGHT", "1.0"))
+PROFILE_TESTS = os.environ.get("BR_PROFILE_TESTS", "0") != "0"
+CHILD_GC_THRESHOLD = int(os.environ.get("BR_CHILD_GC_THRESHOLD", "1000000"))
 ENABLE_TPC_FAST = os.environ.get("BR_ENABLE_TPC_FAST", "1") != "0"
 ENABLE_TPC_FAST_B = os.environ.get("BR_ENABLE_TPC_FAST_B", "1") != "0"
 TPC_PROBE_BUDGET_MS = int(os.environ.get("BR_TPC_PROBE_MS", "300"))
@@ -1041,6 +1043,11 @@ def _start_child_verification(
     try:
         global _SKIP_POOL_PICKLE
         gc.enable()
+        if CHILD_GC_THRESHOLD > 0:
+            # Short-lived child: AST parent links make every parse/optimize churn reference cycles,
+            # and generation-0 collections were a sizable share of verification CPU. Explicit
+            # gc.collect() calls in tests still run.
+            gc.set_threshold(CHILD_GC_THRESHOLD, 50, 100)
         cpu_by_number = {**cpu_by_number, **task.cpu_override}
         _SKIP_POOL_PICKLE = not any(
             p in ("sqlglot/serde.py", "sqlglot/expressions/core.py") for p in task.selection.patched_files
@@ -1271,8 +1278,14 @@ def _start_child_verification(
                         signal.alarm(0)
             return _run_unittest(num)
 
+        _t_last = [time.process_time()]
+
         def _mark(num: int, ok: bool) -> bool:
             """Record a verdict and stream it at once, so a timeout or crash keeps the passes so far."""
+            if PROFILE_TESTS:
+                now = time.process_time()
+                sys.stderr.write("TESTCPU %.3f %s" % (now - _t_last[0], id_by_number[num]) + chr(10))
+                _t_last[0] = now
             (passed if ok else failed).add(num)
             os.write(w_fd, f"{'P' if ok else 'F'} {num}\n".encode())
             if import_hung[0] or timeouts[0] >= 2:

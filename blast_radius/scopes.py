@@ -42,9 +42,14 @@ _LEAF_EXPR_NODES = (
 class Scopes:
     """Where each line of a module sits: functions, classes, statements, class assigns."""
 
-    def __init__(self, tree: ast.Module, has_lambda: bool = True):
+    def __init__(self, tree: ast.Module, has_lambda: bool = True, text: str | None = None):
         self.tree = tree
         self._has_lambda = has_lambda
+        # Lines holding the word `lambda`: expressions spanning none of them hold no lambda, so
+        # the walk need not descend into them (most of a big module's nodes).
+        self._lambda_lines: list[int] | None = (
+            [i for i, line in enumerate(text.splitlines(), 1) if "lambda" in line] if text is not None else None
+        )
         self.functions: list[tuple[int, int, int, str, ast.AST]] = []
         self.lambdas: list[tuple[int, int, int]] = []
         self.classes: list[tuple[int, int, str]] = []
@@ -97,7 +102,9 @@ class Scopes:
                     self._walk(child, qualname + ".")
                 else:
                     self._walk(child, prefix)
-            elif self._has_lambda:
+            elif self._has_lambda and (
+                isinstance(child, (ast.ExceptHandler, ast.match_case)) or self._may_hold_lambda(child)
+            ):
                 if isinstance(child, ast.Lambda):
                     # (body start, body end, header line): a body line below the header only runs
                     # when the lambda is called; the header line also runs where it is defined.
@@ -105,6 +112,23 @@ class Scopes:
                 self._walk(child, prefix)
             elif isinstance(child, (ast.ExceptHandler, ast.match_case)):
                 self._walk(child, prefix)
+
+    def _may_hold_lambda(self, node: ast.AST) -> bool:
+        lines = self._lambda_lines
+        if lines is None:
+            return True
+        start = getattr(node, "lineno", None)
+        end = getattr(node, "end_lineno", None)
+        if start is None or end is None:
+            return True
+        lo, hi = 0, len(lines)
+        while lo < hi:  # first lambda line >= start
+            mid = (lo + hi) // 2
+            if lines[mid] < start:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo < len(lines) and lines[lo] <= end
 
     def function_at(self, lineno: int):
         """Innermost function whose body or header holds the line."""
