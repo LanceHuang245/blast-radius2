@@ -11,6 +11,8 @@ Build: python -m blast_radius.import_state   (writes map/import_state.marshal)
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import hashlib
 import marshal
 import os
@@ -42,21 +44,33 @@ def _digest_value(value, owner: str, seen: set[int], out: list[str]) -> None:
             _digest_value(item, owner, seen, out)
         out.append("]")
     elif isinstance(value, (set, frozenset)):
+        # Iteration order follows hashes: digest each element on its own copy of `seen`, so what
+        # one element marks as seen cannot change how another is written.
         parts = []
         for item in value:
             sub: list[str] = []
-            _digest_value(item, owner, seen, sub)
+            _digest_value(item, owner, set(seen), sub)
             parts.append("".join(sub))
+        for item in value:
+            if isinstance(item, (type, types.FunctionType)) or type(item).__module__.startswith("sqlglot"):
+                seen.add(id(item))
         out.append("{" + ",".join(sorted(parts)) + "}")
     elif isinstance(value, dict):
-        parts = []
+        # Visit values in key order, not insertion order: `seen` makes a shared object's first
+        # visit write more than later ones, so the visiting order must not depend on how
+        # (or in what order of imports) the dict was filled.
+        keyed = []
         for key, item in value.items():
-            sub: list[str] = []
-            _digest_value(key, owner, seen, sub)
-            sub.append(":")
+            ksub: list[str] = []
+            _digest_value(key, owner, set(seen), ksub)
+            keyed.append(("".join(ksub), key, item))
+        keyed.sort(key=lambda entry: entry[0])
+        parts = []
+        for key_text, _key, item in keyed:
+            sub: list[str] = [key_text, ":"]
             _digest_value(item, owner, seen, sub)
             parts.append("".join(sub))
-        out.append("{" + ",".join(sorted(parts)) + "}")
+        out.append("{" + ",".join(parts) + "}")
     elif isinstance(value, (staticmethod, classmethod)):
         _digest_value(value.__func__, owner, seen, out)
     elif isinstance(value, property):
@@ -107,6 +121,21 @@ def _digest_value(value, owner: str, seen: set[int], out: list[str]) -> None:
                 if hasattr(value, slot):
                     attrs[slot] = getattr(value, slot)
         _digest_value(attrs, owner, seen, out)
+    elif isinstance(value, functools.partial):
+        out.append("P[")
+        _digest_value(value.func, owner, seen, out)
+        _digest_value(value.args, owner, seen, out)
+        _digest_value(value.keywords, owner, seen, out)
+        out.append("]")
+    elif isinstance(value, dataclasses.Field):
+        out.append("DF" + str(value.name) + "|")
+        if value.default is not dataclasses.MISSING:
+            _digest_value(value.default, owner, seen, out)
+        if value.default_factory is not dataclasses.MISSING:
+            _digest_value(value.default_factory, owner, seen, out)
+    elif type(value).__name__ == "_abc_data" or type(value).__name__ in ("RLock", "lock", "_RLock"):
+        # ABC registry caches and import locks: runtime bookkeeping, not state the import built.
+        out.append("<" + type(value).__name__ + ">")
     else:
         # Typing constructs, __future__ features and the like: a repr without an address is stable.
         text = repr(value)
@@ -132,10 +161,17 @@ def module_digest(name: str) -> str | None:
     return hashlib.blake2b("\n".join(out).encode(), digest_size=16).hexdigest()
 
 
+def digests_for(names: list[str]) -> dict[str, str | None]:
+    """Digest `names` (in sorted order). Dicts are visited in key order and set elements on
+    their own `seen` copy, so a module's digest does not depend on what was digested before."""
+    return {name: module_digest(name) for name in sorted(set(names))}
+
+
 def import_all_sqlglot() -> None:
     """Import every sqlglot module, the way the coverage map does before any test."""
     import importlib
     import pkgutil
+    import unittest  # noqa: F401  (tests run with unittest loaded: sqlglot reads that at import)
 
     import sqlglot
 
@@ -179,7 +215,7 @@ def main() -> None:
         sys.settrace(None)
 
     owner_names = sorted({o for per_line in owners.values() for names in per_line.values() for o in names})
-    digests = {name: module_digest(name) for name in owner_names}
+    digests = {name: module_digest(name) for name in owner_names}  # canonical (sorted) order
     # Keep only digests that also come out the same in fresh processes with other hash seeds.
     for seed in ("1", "2"):
         other = marshal.loads(
@@ -194,7 +230,7 @@ def main() -> None:
     # And the same in the runtime checker itself, from a fresh process (no sqlglot imported yet).
     runtime = marshal.loads(
         subprocess.run(
-            [sys.executable, "-m", "blast_radius.import_state", "--runtime", *sorted(digests)],
+            [sys.executable, "-m", "blast_radius.import_state", "--runtime", *owner_names],
             capture_output=True,
             check=True,
         ).stdout
@@ -203,6 +239,7 @@ def main() -> None:
     data = {
         "owners": {rel: {ln: sorted(names) for ln, names in per.items()} for rel, per in owners.items()},
         "digests": digests,
+        "order": owner_names,
     }
     STATE_FILE.write_bytes(marshal.dumps(data))
     print(
@@ -216,7 +253,7 @@ if __name__ == "__main__":
     if sys.argv[1:2] == ["--digests"]:
         sys.path.insert(0, str(SOURCE))
         import_all_sqlglot()
-        sys.stdout.buffer.write(marshal.dumps({name: module_digest(name) for name in sys.argv[2:]}))
+        sys.stdout.buffer.write(marshal.dumps({name: module_digest(name) for name in sys.argv[2:]}))  # caller passes canonical order
     elif sys.argv[1:2] == ["--runtime"]:
         from blast_radius.verify import import_state_digests
 

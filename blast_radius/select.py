@@ -547,6 +547,9 @@ class Selector:
             from blast_radius.values import ValueMap
 
             self.values = ValueMap(values_file, impact.test_ids)
+        self._registry_bits = sum(
+            1 << i for i, t in enumerate(impact.test_ids) if t == "tests/dialects/test_dialect.py::TestDialect::test_enum"
+        )
         docs = [i for i, t in enumerate(impact.test_ids) if t.startswith("tests/test_docs.py")]
         self.docs_mask = sum(1 << i for i in docs)
         exec_cls_mask = impact.by_class.get("tests/test_executor.py::TestExecutor", 0)
@@ -678,6 +681,12 @@ class Selector:
                 if self._no_verify:
                     # The import check runs the patched code, which this commit cannot overlay.
                     mask, owners, lazy_pp_mask = coarse_mask, [], 0
+            if owners and self._registry_bits:
+                # The edited code runs while modules import, i.e. on the paths that lazily load
+                # dialects. test_enum reads the global dialect registry that earlier tests filled:
+                # its outcome depends on other tests' calls, which per-test coverage cannot show.
+                mask |= self._registry_bits
+                coarse_mask |= self._registry_bits
             reason = "noop" if all_noop and mask == 0 else "mapped"
             return Selection(
                 mask=mask,

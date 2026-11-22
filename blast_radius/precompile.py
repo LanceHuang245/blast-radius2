@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import concurrent.futures as cf
+import gc
 import gzip
 import importlib
 import json
@@ -310,6 +311,10 @@ def _calibrate_and_update_tpc_meta(src: Path, all_test_ids: list[str]) -> dict[s
         if cls is None:
             continue
         try:
+            # Verification children run on a frozen heap (the parent gc.freeze()s before forking):
+            # calibrate the same way, or gc-heavy tests (gc.collect() loops) look ~1000x dearer.
+            gc.collect()
+            gc.freeze()
             t0 = time.process_time()
             res = unittest.TestResult()
             cls(meth_name).run(res)

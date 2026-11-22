@@ -106,11 +106,11 @@ TPC_EST_CPU_MS = {
 # A proven pass drops test_execute_tpcds (21.5 s, usually the critical worker): a dozen-plus changed
 # plans whose rows all match is still far cheaper than keeping it, and real breakage mostly shows
 # up in the first (cheapest) re-executed queries.
-TPC_REEXEC_MAX_QUERIES = int(os.environ.get("BR_TPC_REEXEC_MAX", "60"))
-TPC_REEXEC_EST_BUDGET_MS = int(os.environ.get("BR_TPC_REEXEC_EST_MS", "9000"))
-TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "16.0"))
-TPC_DUCK_MAX_QUERIES = int(os.environ.get("BR_TPC_DUCK_MAX", "60"))
-TPC_DUCK_BUDGET_S = float(os.environ.get("BR_TPC_DUCK_BUDGET", "10.0"))
+TPC_REEXEC_MAX_QUERIES = int(os.environ.get("BR_TPC_REEXEC_MAX", "99"))
+TPC_REEXEC_EST_BUDGET_MS = int(os.environ.get("BR_TPC_REEXEC_EST_MS", "16000"))
+TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "24.0"))
+TPC_DUCK_MAX_QUERIES = int(os.environ.get("BR_TPC_DUCK_MAX", "99"))
+TPC_DUCK_BUDGET_S = float(os.environ.get("BR_TPC_DUCK_BUDGET", "15.0"))
 
 _meta_cache: dict | None = None
 _ckpts_meta_cache: dict | None = None
@@ -1049,12 +1049,20 @@ def verify_optimized_tpch(patched_files: dict[str, str]) -> bool:
         return False
     from sqlglot import transpile
 
+    changed: list[tuple[str, str]] = []
     for sql, opt_sql, exp_sql_duck, exp_opt_duck in pairs:
-        if transpile(sql, write="duckdb")[0] != exp_sql_duck:
-            return False
-        if transpile(opt_sql, write="duckdb")[0] != exp_opt_duck:
-            return False
-    return True
+        for src, expected in ((sql, exp_sql_duck), (opt_sql, exp_opt_duck)):
+            got = transpile(src, write="duckdb")[0]
+            if got != expected:
+                changed.append((got, expected))
+    if not changed:
+        return True
+    # The test only compares what DuckDB returns for these strings: a changed string that returns
+    # exactly the pinned columns, types and rows leaves both sides of every comparison unchanged.
+    try:
+        return _same_duckdb_results("tpch", changed)
+    except Exception:
+        return False
 
 
 _TOK_POS_NAMES = frozenset({"_current", "_start", "_size", "_line", "_col", "_lines", "tokens", "len"})

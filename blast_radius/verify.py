@@ -340,12 +340,12 @@ def import_state_digests(patched_files: dict[str, str], names: list[str]) -> dic
             sys.path.insert(0, str(SOURCE))
             sys.meta_path.insert(0, _OverlayFinder(patched_files))
             _install_open_overlay(patched_files)
-            from blast_radius.import_state import import_all_sqlglot, module_digest
+            from blast_radius.import_state import digests_for, import_all_sqlglot
 
             # Import everything, as the build did: importing only the owners builds different
             # state for some of them (generators.duckdb), which would hide every narrowing.
             import_all_sqlglot()
-            payload = marshal.dumps({name: module_digest(name) for name in names})
+            payload = marshal.dumps(digests_for(names))
         except BaseException:
             pass
         finally:
@@ -1040,10 +1040,11 @@ def _start_child_verification(
         _patch_pool_references()
         _install_fail_fast_subtest()
 
-        hung = [False]
+        timeouts = [0]
+        import_hung = [False]
 
         def _alarm_handler(_signum, _frame):
-            hung[0] = True
+            timeouts[0] += 1
             raise _Deadline("test timed out")
 
         # Installed before any patched import: a mutant that loops at import time must raise,
@@ -1073,6 +1074,8 @@ def _start_child_verification(
                     lazy_load_ok = lazy_ok
                 except BaseException:
                     lazy_load_ok = False
+                    # Importing the patched dialects hangs: every test would hang the same way.
+                    import_hung[0] = timeouts[0] > 0
                 finally:
                     signal.alarm(0)
         else:
@@ -1194,7 +1197,7 @@ def _start_child_verification(
                 return True if lazy_load_ok is None and task.phase == 2 else bool(lazy_load_ok)
             if task.tpc_mode and tid in TPC_SUITE_BY_TEST_ID:
                 suite = TPC_SUITE_BY_TEST_ID[tid]
-                signal.alarm(65)
+                signal.alarm(90)
                 try:
                     return verify_tpc_test(
                         suite,
@@ -1260,9 +1263,11 @@ def _start_child_verification(
             """Record a verdict and stream it at once, so a timeout or crash keeps the passes so far."""
             (passed if ok else failed).add(num)
             os.write(w_fd, f"{'P' if ok else 'F'} {num}\n".encode())
-            if hung[0]:
-                # Something timed out: the patch most likely hangs, so every remaining test would
-                # burn its own timeout too. Stop; unverified tests stay selected.
+            if import_hung[0] or timeouts[0] >= 2:
+                # The patched import hangs, or two tests ran out of time: the patch most likely
+                # hangs, and every remaining test would burn its own timeout too. Stop; unverified
+                # tests stay selected. (One timeout alone can be a test the patch merely slowed,
+                # and stopping there would throw away cheap later proofs such as TPC-DS.)
                 os.close(w_fd)
                 os._exit(0)
             return ok
@@ -2112,7 +2117,7 @@ def _run_batch_parallel(
             limit_cpu_ms = task.est_cpu_ms
             if task.tpc_mode == "fast_a" and any(id_by_number[n] in TPC_SUITE_BY_TEST_ID for n in task.decap_targets):
                 # fast_a re-executes the queries whose plans changed, up to a full_cached run.
-                limit_cpu_ms += round((TPC_REEXEC_BUDGET_S + TPC_DUCK_BUDGET_S) * 1000 / CHILD_LIMIT_FACTOR)
+                limit_cpu_ms += round((TPC_REEXEC_BUDGET_S + TPC_DUCK_BUDGET_S) * 2000 / CHILD_LIMIT_FACTOR)
             limit_s = min(CHILD_LIMIT_BASE_S + CHILD_LIMIT_FACTOR * limit_cpu_ms / 1000, remaining)
             pid, r_fd = _start_child_verification(task, id_by_number, ms_by_number, cpu_by_number, out_fd)
             active[r_fd] = (pid, task, time.monotonic() + limit_s, [])
