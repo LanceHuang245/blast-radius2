@@ -47,7 +47,12 @@ def main() -> None:
     # Phase 0: static selection across all commits.
     entries: list[tuple[str, set[int], Selection]] = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
-        sel = selector.select_detailed(patch.read_text(encoding="utf-8", errors="replace"))
+        try:
+            sel = selector.select_detailed(patch.read_text(encoding="utf-8", errors="replace"))
+        except Exception as error:
+            log(f"{patch.stem}: selection error {error!r}; running everything")
+            entries.append((patch.stem, set(number_by_id.values()), None))
+            continue
         if sel.import_checks:
             # An edited statement ran during other modules' imports: with gc.freeze() the child-fork
             # digest check costs ~0.25s and preserves Phase-2 + per-case edited_spans filtering.
@@ -68,7 +73,11 @@ def main() -> None:
             if worth_check and os.environ.get("BR_VERIFY", "1") != "0":
                 from blast_radius.verify import check_import_state
 
-                same = check_import_state(sel.patched_files, sel.import_checks)
+                try:
+                    same = check_import_state(sel.patched_files, sel.import_checks)
+                except Exception as error:  # never let one commit's check abort the batch
+                    log(f"{patch.stem}: import state check error {error!r}")
+                    same = False
                 log(f"{patch.stem}: import state of {sel.import_checks} {'unchanged' if same else 'CHANGED'}")
             else:
                 same = False
@@ -97,14 +106,19 @@ def main() -> None:
     if os.environ.get("BR_VERIFY", "1") != "0":
         from blast_radius.verify import plan_verification, verify_batches
 
-        phase1, phase2 = plan_verification(entries, id_by_number, ms_by_number, cpu_by_number, numbers)
-        verified = verify_batches(phase1, phase2, id_by_number, ms_by_number, out_fd, cpu_by_number, len(entries))
+        try:
+            phase1, phase2 = plan_verification([e for e in entries if e[2] is not None], id_by_number, ms_by_number, cpu_by_number, numbers)
+            verified = verify_batches(phase1, phase2, id_by_number, ms_by_number, out_fd, cpu_by_number, len(entries))
+        except Exception as error:  # static selections are always safe to print
+            log(f"verification aborted: {error!r}")
+            verified = {}
 
     for commit, chosen, sel in entries:
         final_chosen = verified.get(commit, chosen)
         workers = split([(ms_by_number[n], n) for n in final_chosen])
         out.write(json.dumps({"commit": commit, "workers": workers}) + "\n")
-        tag = f"{sel.reason}->verified({len(chosen)}->{len(final_chosen)})" if commit in verified else sel.reason
+        reason = sel.reason if sel is not None else "everything (error)"
+        tag = f"{reason}->verified({len(chosen)}->{len(final_chosen)})" if commit in verified else reason
         log(f"{commit}: {len(final_chosen)} tests, {len(workers)} workers, {tag}")
 
     out.flush()

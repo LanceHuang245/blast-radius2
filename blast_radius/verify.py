@@ -43,7 +43,9 @@ from blast_radius.impact_map import module_name
 from blast_radius.schedule import split_with_cost
 from blast_radius.select import Selection
 from blast_radius.tpc_verify import (
+    TPC_DUCK_BUDGET_S,
     TPC_EST_CPU_MS,
+    TPC_REEXEC_BUDGET_S,
     TPC_SUITE_BY_TEST_ID,
     est_tpc_fast_a_ms,
     est_tpc_mode_ms,
@@ -306,6 +308,18 @@ def _install_open_overlay(patched_files: dict[str, str | None]) -> None:
 _IMPORT_DIGESTS: dict[str, str] | None = None
 
 
+class _Deadline(BaseException):
+    """Raised by SIGALRM. Not an Exception, so code under test (e.g. a parser loop with
+    `except Exception`) cannot swallow it and keep spinning."""
+
+
+def _raise_timeout(signum, frame):
+    raise _Deadline("timed out")
+
+
+IMPORT_STATE_LIMIT_S = 6.0
+
+
 def import_state_digests(patched_files: dict[str, str], names: list[str]) -> dict[str, str | None]:
     """Import every sqlglot module with the patch in a forked child and digest `names`
     (see blast_radius.import_state). Empty if the child fails."""
@@ -314,8 +328,13 @@ def import_state_digests(patched_files: dict[str, str], names: list[str]) -> dic
     pid = os.fork()
     if pid == 0:
         os.close(r_fd)
+        try:
+            os.setpgid(0, 0)
+        except OSError:
+            pass
         payload = marshal.dumps({})
         try:
+            signal.signal(signal.SIGALRM, _raise_timeout)
             signal.alarm(30)
             os.chdir(SOURCE)
             sys.path.insert(0, str(SOURCE))
@@ -334,11 +353,25 @@ def import_state_digests(patched_files: dict[str, str], names: list[str]) -> dic
             os._exit(0)
     os.close(w_fd)
     chunks = []
-    while chunk := os.read(r_fd, 65536):
+    deadline = time.monotonic() + IMPORT_STATE_LIMIT_S
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([r_fd], [], [], remaining)[0]:
+            chunks = []  # too slow: whatever the child sends now is not trusted
+            break
+        chunk = os.read(r_fd, 65536)
+        if not chunk:
+            break
         chunks.append(chunk)
+    _kill_group(pid)
     os.close(r_fd)
     os.waitpid(pid, 0)
-    return marshal.loads(b"".join(chunks))
+    try:
+        # A child killed mid-import (timeout, crash, recursion) writes nothing: treat as changed.
+        got = marshal.loads(b"".join(chunks))
+    except Exception:
+        return {}
+    return got if isinstance(got, dict) else {}
 
 
 def check_import_state(patched_files: dict[str, str], owners: list[str]) -> bool:
@@ -982,6 +1015,12 @@ def _start_child_verification(
         return pid, r_fd
 
     os.close(r_fd)
+    # Own process group: a timeout kill must also reach subprocesses the tests spawned, or they
+    # keep burning CPU and hold the result pipe open (the parent's drain would block on them).
+    try:
+        os.setpgid(0, 0)
+    except OSError:
+        pass
     if out_fd is not None:
         try:
             os.close(out_fd)
@@ -1001,6 +1040,16 @@ def _start_child_verification(
         _patch_pool_references()
         _install_fail_fast_subtest()
 
+        hung = [False]
+
+        def _alarm_handler(_signum, _frame):
+            hung[0] = True
+            raise _Deadline("test timed out")
+
+        # Installed before any patched import: a mutant that loops at import time must raise,
+        # not hang the child until the parent's much longer backstop kill.
+        signal.signal(signal.SIGALRM, _alarm_handler)
+
         lazy_load_ok: bool | None = None
         if task.phase == 1:
             if "sqlglot" in sys.modules:
@@ -1012,6 +1061,7 @@ def _start_child_verification(
                 "tests/dialects/test_dialect.py" not in task.selection.patched_files
                 and any(id_by_number[n] == LAZY_LOAD_TEST_ID for n in task.chosen)
             ):
+                signal.alarm(6)
                 try:
                     import sqlglot as _sg
 
@@ -1023,6 +1073,8 @@ def _start_child_verification(
                     lazy_load_ok = lazy_ok
                 except BaseException:
                     lazy_load_ok = False
+                finally:
+                    signal.alarm(0)
         else:
             _install_open_overlay(task.selection.patched_files)
             if task.selection.hot_patch_targets:
@@ -1044,11 +1096,6 @@ def _start_child_verification(
                     os.write(w_fd, b"FAIL_PATCH")
                     os.close(w_fd)
                     os._exit(0)
-
-        def _alarm_handler(_signum, _frame):
-            raise TimeoutError("test timed out")
-
-        signal.signal(signal.SIGALRM, _alarm_handler)
 
         failed: set[int] = set()
         passed: set[int] = set()
@@ -1213,6 +1260,11 @@ def _start_child_verification(
             """Record a verdict and stream it at once, so a timeout or crash keeps the passes so far."""
             (passed if ok else failed).add(num)
             os.write(w_fd, f"{'P' if ok else 'F'} {num}\n".encode())
+            if hung[0]:
+                # Something timed out: the patch most likely hangs, so every remaining test would
+                # burn its own timeout too. Stop; unverified tests stay selected.
+                os.close(w_fd)
+                os._exit(0)
             return ok
 
         # Step 1: If pushdown_predicates.py:36-37 lazy imports inflated `chosen`, verify clean import in ~10ms.
@@ -1981,6 +2033,17 @@ def _prewarm_for_phase2(
                     _install_block_filter(mod, getattr(mod, parts[1]), parts[2])
 
 
+def _kill_group(pid: int) -> None:
+    """SIGKILL the process group led by `pid` (the verification child and its subprocesses)."""
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+
+
 def _run_batch_parallel(
     tasks: list[VerifyTask],
     id_by_number: dict[int, str],
@@ -1996,13 +2059,13 @@ def _run_batch_parallel(
     # active: r_fd -> (pid, task, deadline, chunks_list)
     active: dict[int, tuple[int, VerifyTask, float, list[bytes]]] = {}
 
+    reaped: dict[int, tuple[int, object]] = {}
+
     def finish_child(r_fd: int, timed_out: bool) -> None:
         pid, task, limit_deadline, chunks = active.pop(r_fd)
-        if timed_out:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        # Kill the whole group: on a timeout the child itself, and in every case any subprocess
+        # it left behind (which would otherwise keep running and hold the pipe open).
+        _kill_group(pid)
         # Drain what the child streamed before it exited or was killed: each "P n" line is a
         # test that ran to completion and passed, so it stays valid after a kill or crash.
         try:
@@ -2011,7 +2074,10 @@ def _run_batch_parallel(
         except OSError:
             pass
         os.close(r_fd)
-        _, status, rusage = os.wait4(pid, 0)
+        if pid in reaped:
+            status, rusage = reaped.pop(pid)
+        else:
+            _, status, rusage = os.wait4(pid, 0)
         child_cpu = rusage.ru_utime + rusage.ru_stime
         raw = b"".join(chunks)
         if raw.startswith(b"FAIL_PATCH"):
@@ -2046,7 +2112,7 @@ def _run_batch_parallel(
             limit_cpu_ms = task.est_cpu_ms
             if task.tpc_mode == "fast_a" and any(id_by_number[n] in TPC_SUITE_BY_TEST_ID for n in task.decap_targets):
                 # fast_a re-executes the queries whose plans changed, up to a full_cached run.
-                limit_cpu_ms += TPC_EST_CPU_MS[("tpcds", "full_cached")]
+                limit_cpu_ms += round((TPC_REEXEC_BUDGET_S + TPC_DUCK_BUDGET_S) * 1000 / CHILD_LIMIT_FACTOR)
             limit_s = min(CHILD_LIMIT_BASE_S + CHILD_LIMIT_FACTOR * limit_cpu_ms / 1000, remaining)
             pid, r_fd = _start_child_verification(task, id_by_number, ms_by_number, cpu_by_number, out_fd)
             active[r_fd] = (pid, task, time.monotonic() + limit_s, [])
@@ -2061,10 +2127,28 @@ def _run_batch_parallel(
         if not active:
             continue
 
+        # A child that exited while a subprocess of its still holds the pipe never reaches EOF:
+        # notice the exit itself and finish it now.
+        # waitpid(-1) also reaps killed subprocesses re-parented to us (we may be PID 1), which
+        # would otherwise pile up as zombies against the container's process limit.
+        fd_by_pid = {pid: r_fd for r_fd, (pid, _, _, _) in active.items()}
+        while True:
+            try:
+                got_pid, status, rusage = os.wait4(-1, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if got_pid == 0:
+                break
+            if got_pid in fd_by_pid:
+                reaped[got_pid] = (status, rusage)
+                finish_child(fd_by_pid.pop(got_pid), timed_out=False)
+        if not active:
+            continue
+
         min_rem = min(dl - time.monotonic() for _, _, dl, _ in active.values())
         if min_rem <= 0:
             continue
-        ready, _, _ = select.select(list(active.keys()), [], [], min_rem)
+        ready, _, _ = select.select(list(active.keys()), [], [], min(min_rem, 0.25))
         for r_fd in ready:
             if r_fd not in active:
                 continue
