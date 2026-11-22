@@ -13,6 +13,70 @@ from blast_radius.schedule import split, split_with_cost
 from blast_radius.select import Selection, Selector
 
 
+def _run_fixture_check(patched_files: dict, limit_s: float = 45.0) -> set[str]:
+    """TPC fixture verifiers in a forked child on pinned sqlglot: test ids proven to pass."""
+    import select
+    import signal
+    import time
+
+    from blast_radius import SOURCE
+
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r_fd)
+        proven: set[str] = set()
+        try:
+            os.setpgid(0, 0)
+            os.chdir(SOURCE)
+            sys.path.insert(0, str(SOURCE))
+            os.environ["SKIP_INTEGRATION"] = "0"
+            from blast_radius.tpc_verify import (
+                TPCDS_FIXTURE,
+                TPCH_FIXTURE,
+                verify_tpcds_fixture_edit,
+                verify_tpch_fixture_edit,
+            )
+
+            if TPCDS_FIXTURE in patched_files:
+                old_text = (SOURCE / TPCDS_FIXTURE).read_text(encoding="utf-8")
+                if verify_tpcds_fixture_edit(old_text, patched_files[TPCDS_FIXTURE]):
+                    proven.add("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+            if TPCH_FIXTURE in patched_files:
+                old_text = (SOURCE / TPCH_FIXTURE).read_text(encoding="utf-8")
+                proven |= verify_tpch_fixture_edit(old_text, patched_files[TPCH_FIXTURE])
+        except BaseException:
+            pass
+        finally:
+            os.write(w_fd, json.dumps(sorted(proven)).encode())
+            os._exit(0)
+    os.close(w_fd)
+    got = b""
+    deadline = time.monotonic() + limit_s
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([r_fd], [], [], remaining)[0]:
+            got = b""
+            break
+        chunk = os.read(r_fd, 64)
+        if not chunk:
+            break
+        got += chunk
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    os.close(r_fd)
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
+    try:
+        return set(json.loads(got.decode())) if got else set()
+    except ValueError:
+        return set()
+
+
 def main() -> None:
     gc.disable()
     # Dedicate a private fd to JSON answers and redirect fd 1 -> fd 2 so imported
@@ -112,6 +176,32 @@ def main() -> None:
         except Exception as error:  # static selections are always safe to print
             log(f"verification aborted: {error!r}")
             verified = {}
+
+    # Fixture-only edits of tpc-ds.sql / tpc-h.sql: the TPC executor tests only use the pairs in
+    # specific ways, so re-run just the changed pairs the way each test does (pinned code).
+    if os.environ.get("BR_VERIFY", "1") != "0":
+        tpc_nums = {
+            number_by_id.get(t)
+            for t in (
+                "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+                "tests/test_executor.py::TestExecutor::test_execute_tpch",
+                "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+            )
+        } - {None}
+        fixtures = ("tests/fixtures/optimizer/tpc-ds/tpc-ds.sql", "tests/fixtures/optimizer/tpc-h/tpc-h.sql")
+        for commit, chosen, sel in entries:
+            cur = verified.get(commit, chosen)
+            if sel is None or not (tpc_nums & set(cur)) or not sel.patched_files:
+                continue
+            if not any(f in sel.patched_files for f in fixtures) or not all(
+                p.startswith("tests/fixtures/") and not p.endswith(".py") and sel.patched_files[p] is not None
+                for p in sel.patched_files
+            ):
+                continue
+            proven = {number_by_id[t] for t in _run_fixture_check(sel.patched_files) if t in number_by_id}
+            log(f"{commit}: tpc fixture check proved {len(proven & set(cur))} test(s)")
+            if proven & set(cur):
+                verified[commit] = set(cur) - proven
 
     for commit, chosen, sel in entries:
         final_chosen = verified.get(commit, chosen)

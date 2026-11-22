@@ -18,7 +18,7 @@ class FilePatch:
 def parse_patch(text: str) -> list[FilePatch]:
     files: list[FilePatch] = []
     current: FilePatch | None = None
-    lines = text.split("\n")
+    lines = [ln[:-1] if ln.endswith("\r") else ln for ln in text.split("\n")]
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -30,6 +30,15 @@ def parse_patch(text: str) -> list[FilePatch]:
             if len(parts) == 4:
                 current.old, current.new = parts[2][2:], parts[3][2:]
             continue
+        if (
+            line.startswith("--- ")
+            and i < len(lines)
+            and lines[i].startswith("+++ ")
+            and (current is None or current.hunks)
+        ):
+            # Plain unified diff (no `diff --git` header): a ---/+++ pair opens the next file.
+            current = FilePatch()
+            files.append(current)
         if current is None:
             continue
         if line.startswith("--- "):

@@ -1262,3 +1262,141 @@ def verify_lazy_athena_presto(patched_files: dict[str, str] | None = None) -> bo
         [c.__name__ for c in Athena.__mro__] == ["Athena", "Trino", "Presto", "Dialect", "object"]
         and [c.__name__ for c in Presto.__mro__] == ["Presto", "Dialect", "object"]
     )
+
+
+TPCDS_FIXTURE = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
+TPCDS_FIXTURE_MAX_QUERIES = int(os.environ.get("BR_TPCDS_FIXTURE_MAX", "8"))
+
+
+def _fixture_pairs_like_test(text: str) -> list[tuple[dict, str, str]]:
+    """tests.helpers.load_sql_fixture_pairs, on a string."""
+    from tests.helpers import _extract_meta, _filter_comments
+
+    statements = _filter_comments(text).split(";")
+    out = []
+    for i in range(0, len(statements), 2):
+        if i + 1 < len(statements):
+            sql, meta = _extract_meta(statements[i].strip())
+            out.append((meta, sql, statements[i + 1].strip()))
+    return out
+
+
+def verify_tpcds_fixture_edit(old_text: str, new_text: str) -> bool:
+    """True iff TestExecutor.test_execute_tpcds passes with the edited tpc-ds.sql (pinned code).
+
+    The test ignores each pair's expected SQL: for every `execute: true` pair it runs the input
+    SQL through the Python executor and through DuckDB (transpiled) and compares the frames.
+    Pairs whose (meta, input SQL) did not change give the pinned (passing) results, so only the
+    changed pairs are run here, the same way the test runs them.
+    """
+    import numpy as np
+    import pandas as pd
+    from pandas.testing import assert_frame_equal
+
+    from sqlglot import parse_one, transpile
+    from sqlglot.executor import execute
+    from sqlglot.executor.table import Table
+    from sqlglot import exp
+
+    old = _fixture_pairs_like_test(old_text)
+    new = _fixture_pairs_like_test(new_text)
+    todo = [
+        i for i in range(len(new))
+        if (i >= len(old) or (new[i][0], new[i][1]) != (old[i][0], old[i][1])) and new[i][0].get("execute")
+    ]
+    if not todo:
+        return True
+    if len(todo) > TPCDS_FIXTURE_MAX_QUERIES or not (TPC_S2_BLOBS_DIR / "tpcds" / "meta.pkl").is_file():
+        return False
+    import duckdb
+    from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA
+
+    with open(TPC_S2_BLOBS_DIR / "tpcds" / "meta.pkl", "rb") as handle:
+        schema_map = pickle.load(handle)["schema"]
+    conn = duckdb.connect()
+    made: set[str] = set()
+    rows_cache: dict[str, list] = {}
+    try:
+        for i in todo:
+            sql = new[i][1]
+            expression = parse_one(sql)
+            names = {t.name for t in expression.find_all(exp.Table)}
+            tables = {}
+            for name in names:
+                if name not in schema_map or name not in TPCDS_SCHEMA:
+                    continue  # the test would raise KeyError: let execute() fail the same way
+                if name not in rows_cache:
+                    with open(tpc_s2_table_file("tpcds", name), "rb") as handle:
+                        rows_cache[name] = pickle.load(handle)
+                tables[name] = Table(columns=schema_map[name], rows=list(rows_cache[name]))
+                if name not in made:
+                    conn.execute(
+                        f"CREATE VIEW {name} AS SELECT * FROM READ_CSV("
+                        f"'{FIXTURES_DIR}/optimizer/tpc-ds/{name}.csv.gz', delim='|', header=True, "
+                        f"columns={TPCDS_SCHEMA[name]})"
+                    )
+                    made.add(name)
+            table = execute(expression, schema=schema_map, tables=tables)
+            a = conn.execute(transpile(sql, write="duckdb")[0]).fetchdf()
+            b = pd.DataFrame(((np.nan if c is None else c for c in r) for r in table.rows), columns=table.columns)
+            assert_frame_equal(a, b, check_dtype=False, check_index_type=False)
+        return True
+    except BaseException:
+        return False
+    finally:
+        conn.close()
+
+
+TPCH_FIXTURE = "tests/fixtures/optimizer/tpc-h/tpc-h.sql"
+
+
+def verify_tpch_fixture_edit(old_text: str, new_text: str) -> set[str]:
+    """Test ids among test_execute_tpch / test_optimized_tpch proven to pass with the edited
+    tpc-h.sql (pinned code). Mirrors what each test does with the fixture pairs."""
+    proven: set[str] = set()
+    old = _fixture_pairs_like_test(old_text)
+    new = _fixture_pairs_like_test(new_text)
+    if len(old) != len(new):
+        return proven
+    from sqlglot import parse_one, transpile
+
+    changed = [i for i in range(len(new)) if new[i] != old[i]]
+    # test_execute_tpch: parse_one(sql) for every pair in the test process; only `execute: true`
+    # pairs are run (none at the pinned commit).
+    try:
+        if all(not new[i][0].get("execute") for i in range(len(new))):
+            for i in changed:
+                parse_one(new[i][1])
+            proven.add("tests/test_executor.py::TestExecutor::test_execute_tpch")
+    except BaseException:
+        pass
+    # test_optimized_tpch: DuckDB(transpile(sql)) vs DuckDB(transpile(optimized)), anonymous
+    # columns renamed, assert_frame_equal (dtype-checked).
+    if len(changed) > 8:
+        return proven
+    try:
+        import duckdb
+        from pandas.testing import assert_frame_equal
+        from tests.helpers import FIXTURES_DIR, TPCH_SCHEMA
+
+        conn = duckdb.connect()
+        try:
+            for table, columns in TPCH_SCHEMA.items():
+                conn.execute(
+                    f"CREATE VIEW {table} AS SELECT * FROM READ_CSV("
+                    f"'{FIXTURES_DIR}/optimizer/tpc-h/{table}.csv.gz', delim='|', header=True, columns={columns})"
+                )
+            for i in changed:
+                _, sql, optimized = new[i]
+                a = conn.execute(transpile(sql, write="duckdb")[0]).fetchdf()
+                b = conn.execute(transpile(optimized, write="duckdb")[0]).fetchdf()
+                for k, column in enumerate(b.columns):
+                    if "_col_" in column:
+                        b.rename(columns={column: a.columns[k]}, inplace=True)
+                assert_frame_equal(a, b)
+            proven.add("tests/test_executor.py::TestExecutor::test_optimized_tpch")
+        finally:
+            conn.close()
+    except BaseException:
+        pass
+    return proven
