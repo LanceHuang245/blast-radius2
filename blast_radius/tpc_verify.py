@@ -93,8 +93,8 @@ def _all_tpc_safe(
 # All 22 tpch queries have execute=False (parse_one only), so tpch verification takes <100ms.
 TPC_EST_CPU_MS = {
     ("tpcds", "fast_a"): 3000,
-    ("tpcds", "fast_b"): 25000,
-    ("tpcds", "full_cached"): 29000,
+    ("tpcds", "fast_b"): 12000,
+    ("tpcds", "full_cached"): 17500,
     ("tpch", "fast_a"): 80,
     ("tpch", "fast_b"): 30,
     ("tpch", "full_cached"): 100,
