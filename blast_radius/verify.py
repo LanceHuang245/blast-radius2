@@ -70,6 +70,16 @@ MIN_ROI_RATIO = float(os.environ.get("BR_MIN_ROI_RATIO", "1.40"))
 VERIFY_FIXTURE_MAX_MS = int(os.environ.get("BR_FIXTURE_MAX_MS", "0"))
 TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "150000"))
 ENABLE_HOTPATCH = os.environ.get("BR_ENABLE_HOTPATCH", "1") != "0"
+# Tail verification (Step 2c) limits: how much CPU a child may spend dropping passing tests.
+STEP2C_ROUNDS = int(os.environ.get("BR_STEP2C_ROUNDS", "5"))
+STEP2C_EST_CAP_MS = int(os.environ.get("BR_STEP2C_EST_MS", "5000"))
+STEP2C_CPU_S = float(os.environ.get("BR_STEP2C_CPU_S", "12.0"))
+STEP2C_FAIL_ROI = float(os.environ.get("BR_STEP2C_FAIL_ROI", "2.5"))
+STEP2C_KEEP_AFTER_FAIL = os.environ.get("BR_STEP2C_KEEP_AFTER_FAIL", "0") != "0"
+DECAP_CPU_RATIO = float(os.environ.get("BR_DECAP_CPU_RATIO", "0.75"))
+# Weight of a CPU millisecond against a simulated millisecond when choosing what to verify
+# (1.0: break-even on the score; below 1: spend CPU to cut simulated time further).
+CPU_WEIGHT = float(os.environ.get("BR_CPU_WEIGHT", "1.0"))
 ENABLE_TPC_FAST = os.environ.get("BR_ENABLE_TPC_FAST", "1") != "0"
 ENABLE_TPC_FAST_B = os.environ.get("BR_ENABLE_TPC_FAST_B", "1") != "0"
 TPC_PROBE_BUDGET_MS = int(os.environ.get("BR_TPC_PROBE_MS", "300"))
@@ -962,8 +972,8 @@ def _best_drop_prefix(
         while top < len(desc) and desc[top] in removed:
             top += 1
         saved = current - _lb_cost(total, ms_by_number[desc[top]] if top < len(desc) else 0, count)
-        net = saved - spent
-        if net > best_net and saved >= spent * min_roi:
+        net = saved - spent * CPU_WEIGHT
+        if net > best_net and saved >= spent * min_roi * CPU_WEIGHT:
             best_net, best = net, list(prefix)
     return best
 
@@ -1394,12 +1404,12 @@ def _start_child_verification(
             step2c_est_ms = 0
             s2c_failed = 0
             s2c_passed = 0
-            for _ in range(5):
-                if step2c_est_ms > 5000 or time.process_time() - step2c_t0 > 12.0:
+            for _ in range(STEP2C_ROUNDS):
+                if step2c_est_ms > STEP2C_EST_CAP_MS or time.process_time() - step2c_t0 > STEP2C_CPU_S:
                     break
-                if s2c_failed >= 2 and not s2c_passed:
+                if s2c_failed >= 2 and not s2c_passed and not STEP2C_KEEP_AFTER_FAIL:
                     break
-                cur_roi = 2.5 if (s2c_failed >= 2 and s2c_failed >= s2c_passed) else MIN_ROI_RATIO
+                cur_roi = STEP2C_FAIL_ROI if (s2c_failed >= 2 and s2c_failed >= s2c_passed) else MIN_ROI_RATIO
                 s2c_cands = verifiable - passed - failed - blocked_decap
                 if fix_narrow_only:
                     s2c_cands = {n for n in s2c_cands if n in task.case_filter and len(task.case_filter[n]) <= 8}
@@ -1807,7 +1817,7 @@ def plan_verification(
                     raw_decap.append((sim_ms, c_ms, num))
             elif sim_ms >= 150:
                 c_ms = cpu_by_number[num]
-                if c_ms <= sim_ms * 0.75:
+                if c_ms <= sim_ms * DECAP_CPU_RATIO:
                     raw_decap.append((sim_ms, c_ms, num))
 
         # Pick the prefix with the best net makespan / worker-count reduction, trying two
@@ -1832,7 +1842,7 @@ def plan_verification(
                 trial_pool.discard(num)
                 acc_decap_cpu += c_ms
                 new_cost, _ = split_with_cost([(ms_by_number[n], n) for n in trial_pool])
-                net = (static_cost_ms - new_cost) - acc_decap_cpu - (15 if lazy_pp_nums else 0)
+                net = (static_cost_ms - new_cost) - acc_decap_cpu * CPU_WEIGHT - (15 if lazy_pp_nums else 0)
                 chosen_decap.append(num)
                 if net >= order_best + 200:
                     order_best, order_prefix = net, list(chosen_decap)
@@ -1871,12 +1881,12 @@ def plan_verification(
         cost_after, _ = split_with_cost([(ms_by_number[n], n) for n in pool_after_decap - set(tail_prefix)])
         est_cpu_ms = overhead_ms + decap_cpu + tail_cpu
         saved_ms = static_cost_ms - cost_after
-        expected_gain_ms = saved_ms - est_cpu_ms
+        expected_gain_ms = saved_ms - est_cpu_ms * CPU_WEIGHT
         has_heavy_tpc_or_max = any(
             id_by_number[n] in TPC_SUITE_BY_TEST_ID or id_by_number[n] == MAX_NODES_TEST_ID for n in decap_targets
         )
         min_req = TPC_MIN_GAIN_MS if has_heavy_tpc_or_max else MIN_DECAP_GAIN_MS if decap_targets else MIN_GAIN_MS
-        roi_ok = (saved_ms >= est_cpu_ms * MIN_ROI_RATIO) or (saved_ms >= 5000 and expected_gain_ms >= 2500)
+        roi_ok = (saved_ms >= est_cpu_ms * MIN_ROI_RATIO * CPU_WEIGHT) or (saved_ms >= 5000 and expected_gain_ms >= 2500)
         if (expected_gain_ms < min_req or not roi_ok) and decap_targets:
             # Without the decapitation targets, the tail alone may still pay off.
             decap_targets = []
@@ -1884,9 +1894,9 @@ def plan_verification(
             cost_after, _ = split_with_cost([(ms_by_number[n], n) for n in chosen - lazy_pp_nums - set(tail_prefix)])
             est_cpu_ms = overhead_ms + (15 if lazy_pp_nums else 0) + tail_cpu
             saved_ms = static_cost_ms - cost_after
-            expected_gain_ms = saved_ms - est_cpu_ms
+            expected_gain_ms = saved_ms - est_cpu_ms * CPU_WEIGHT
             min_req = MIN_GAIN_MS
-            roi_ok = saved_ms >= est_cpu_ms * MIN_ROI_RATIO
+            roi_ok = saved_ms >= est_cpu_ms * MIN_ROI_RATIO * CPU_WEIGHT
         if not (decap_targets or tail_prefix or lazy_pp_nums) or expected_gain_ms < min_req or not roi_ok:
             continue
 
