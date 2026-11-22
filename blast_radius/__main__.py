@@ -96,11 +96,26 @@ def main() -> None:
     impact = ImpactMap(MAP_FILE)
     # Uncalibrated tests are single-threaded unit/dialect tests whose measured in-process CPU
     # averages ~0.68x of recorded seconds (heavy multiprocess optimizer tests are calibrated).
-    # BR_CPU_SCALE: calibrated container overhead factor paired with MIN_ROI_RATIO (1.20 * 1.40 = 1.68x).
-    cpu_scale = float(os.environ.get("BR_CPU_SCALE", "1.20"))
+    # BR_CPU_SCALE: calibrated container overhead factor paired with MIN_ROI_RATIO.
+    cpu_scale = float(os.environ.get("BR_CPU_SCALE", "1.08"))
     cpu_by_number = {
-        t["number"]: round(impact.real_cpu_ms.get(t["id"], round(t["seconds"] * 750)) * cpu_scale) for t in tests
+        t["number"]: round(impact.real_cpu_ms_py.get(t["id"], round(t["seconds"] * 750)) * cpu_scale) for t in tests
     }
+    cpu_by_number_c = {
+        t["number"]: round(
+            (
+                impact.real_cpu_ms_c[t["id"]]
+                if t["id"] in impact.real_cpu_ms_c
+                else (
+                    impact.real_cpu_ms_py.get(t["id"], round(t["seconds"] * 750))
+                    * (1.0 if t["id"].startswith("tests/test_dialect_imports.py::") else 0.55)
+                )
+            )
+            * cpu_scale
+        )
+        for t in tests
+    }
+    tpc_c_ms = impact.tpc_c_ms
     selector = Selector(impact)
     numbers = [number_by_id.get(test_id) for test_id in impact.test_ids]
     mapped_ids = set(impact.test_ids)
@@ -173,7 +188,15 @@ def main() -> None:
         from blast_radius.verify import plan_verification, verify_batches
 
         try:
-            phase1, phase2 = plan_verification([e for e in entries if e[2] is not None], id_by_number, ms_by_number, cpu_by_number, numbers)
+            phase1, phase2 = plan_verification(
+                [e for e in entries if e[2] is not None],
+                id_by_number,
+                ms_by_number,
+                cpu_by_number,
+                numbers,
+                base_cpu_c=cpu_by_number_c,
+                tpc_c_ms=tpc_c_ms,
+            )
             verified = verify_batches(phase1, phase2, id_by_number, ms_by_number, out_fd, cpu_by_number, len(entries))
         except Exception as error:  # static selections are always safe to print
             log(f"verification aborted: {error!r}")

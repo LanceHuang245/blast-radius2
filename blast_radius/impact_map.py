@@ -43,6 +43,9 @@ class ImpactMap:
         self.pinned_identifiers: set[str] = set(raw.get("pinned_identifiers", []))
         self.exp_usage: dict[str, int] = raw.get("exp_usage", {})
         self.real_cpu_ms: dict[str, int] = raw.get("real_cpu_ms", {})
+        self.real_cpu_ms_c: dict[str, int] = raw.get("real_cpu_ms_c") or {}
+        self.real_cpu_ms_py: dict[str, int] = raw.get("real_cpu_ms_py") or self.real_cpu_ms
+        self.tpc_c_ms: dict[str, int] = raw.get("tpc_c_ms") or {}
         self.leaf_classes: set[str] = set(raw.get("leaf_classes", []))
         self.dict_usage: dict[str, int] = raw.get("dict_usage", {})
         self.everything = (1 << len(self.test_ids)) - 1

@@ -33,7 +33,12 @@ CALIBRATED_TESTS = (
     "tests/test_optimizer.py::TestOptimizer::test_scope",
     "tests/test_optimizer.py::TestOptimizer::test_tpcds",
     "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs",
+    "tests/test_optimizer.py::TestOptimizer::test_annotate_types",
     "tests/test_optimizer.py::TestOptimizer::test_qualify_columns",
+    "tests/test_optimizer.py::TestOptimizer::test_eliminate_joins",
+    "tests/test_optimizer.py::TestOptimizer::test_eliminate_subqueries",
+    "tests/test_optimizer.py::TestOptimizer::test_pushdown_predicates",
+    "tests/test_optimizer.py::TestOptimizer::test_pushdown_projections",
     "tests/test_executor.py::TestExecutor::test_agg_order",
     "tests/test_optimizer.py::TestOptimizer::test_optimize_in_nulls",
     "tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries",
@@ -219,11 +224,17 @@ def _typing_dialect_map(src: Path, trees: dict[str, ast.Module]) -> dict[str, li
     return out
 
 
-def _calibrate_and_update_tpc_meta(src: Path, all_test_ids: list[str]) -> dict[str, int]:
-    """Measure real single-process CPU of optimizer/dialect/heavy tests and append opt_tpch_pairs."""
-    os.chdir(src)
-    if str(src) not in sys.path:
-        sys.path.insert(0, str(src))
+def _calibrate_and_update_tpc_meta(
+    src: Path,
+    all_test_ids: list[str],
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    """Measure pure-Python and modular-C single-process CPU of heavy tests and append opt_tpch_pairs.
+
+    Runs in clean forked children BEFORE parent imports sqlglot so C vs pure-Python measurements
+    do not share sys.modules state. Both children use db_cache + gc.freeze() + high GC threshold
+    matching Phase-2 scoring children.
+    """
+    from blast_radius.c_loader import PURE_PYTHON_ONLY_TESTS, load_c_manifest
 
     class _SyncExec:
         def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **_):
@@ -250,33 +261,9 @@ def _calibrate_and_update_tpc_meta(src: Path, all_test_ids: list[str]) -> dict[s
         def __exit__(self, *exc):
             return False
 
-    cf.ProcessPoolExecutor = _SyncExec
-
-    # Append opt_tpch_pairs to tpc_meta.pkl in ~0.09s without touching the cached precompile_tpc layer.
-    if TPC_META_FILE.is_file():
-        with open(TPC_META_FILE, "rb") as handle:
-            tpc_meta = pickle.load(handle)
-        if "opt_tpch_pairs" not in tpc_meta:
-            from sqlglot import transpile
-            from tests.helpers import load_sql_fixture_pairs
-
-            tpch_sqls = list(load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
-            tpc_meta["opt_tpch_pairs"] = [
-                (
-                    sql,
-                    optimized,
-                    transpile(sql, write="duckdb")[0],
-                    transpile(optimized, write="duckdb")[0],
-                )
-                for _, sql, optimized in tpch_sqls
-            ]
-            with open(TPC_META_FILE, "wb") as handle:
-                pickle.dump(tpc_meta, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
     skip_ids = frozenset({
         "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
         "tests/test_parser.py::TestParser::test_max_nodes",
-        "tests/test_generator.py::TestGenerator::test_generator_memory",
         "tests/test_executor.py::TestExecutor::test_execute_tpcds",
         "tests/test_executor.py::TestExecutor::test_execute_tpch",
         "tests/test_executor.py::TestExecutor::test_optimized_tpch",
@@ -290,40 +277,132 @@ def _calibrate_and_update_tpc_meta(src: Path, all_test_ids: list[str]) -> dict[s
             to_calibrate.append(tid)
             seen_cal.add(tid)
 
-    real_cpu_ms: dict[str, int] = {}
-    loaded: dict[tuple[str, str], type | None] = {}
-    for tid in to_calibrate:
-        file_path, cls_name, meth_name = tid.split("::")
-        mod_name = file_path[:-3].replace("/", ".")
-        key = (mod_name, cls_name)
-        if key not in loaded:
+    def _run_child(use_c: bool, out_path: str) -> None:
+        os.chdir(src)
+        if str(src) not in sys.path:
+            sys.path.insert(0, str(src))
+        cf.ProcessPoolExecutor = _SyncExec
+        if use_c:
+            from blast_radius.c_loader import install_modular_c
+
+            install_modular_c(set(), after_overlay=False)
+        from blast_radius.db_cache import install_db_cache, wrap_duckdb_if_loaded
+
+        install_db_cache()
+
+        # Pure-Python child updates tpc_meta["opt_tpch_pairs"] cleanly if not yet present.
+        if not use_c and TPC_META_FILE.is_file():
+            with open(TPC_META_FILE, "rb") as handle:
+                tpc_meta = pickle.load(handle)
+            if "opt_tpch_pairs" not in tpc_meta:
+                from sqlglot import transpile
+                from tests.helpers import load_sql_fixture_pairs
+
+                tpch_sqls = list(load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+                tpc_meta["opt_tpch_pairs"] = [
+                    (
+                        sql,
+                        optimized,
+                        transpile(sql, write="duckdb")[0],
+                        transpile(optimized, write="duckdb")[0],
+                    )
+                    for _, sql, optimized in tpch_sqls
+                ]
+                with open(TPC_META_FILE, "wb") as handle:
+                    pickle.dump(tpc_meta, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+        real_cpu_ms: dict[str, int] = {}
+        loaded: dict[tuple[str, str], type | None] = {}
+        for tid in to_calibrate:
+            if use_c and tid in PURE_PYTHON_ONLY_TESTS:
+                continue
+            file_path, cls_name, meth_name = tid.split("::")
+            mod_name = file_path[:-3].replace("/", ".")
+            key = (mod_name, cls_name)
+            if key not in loaded:
+                try:
+                    mod = importlib.import_module(mod_name)
+                    wrap_duckdb_if_loaded()
+                    if hasattr(mod, "ProcessPoolExecutor"):
+                        setattr(mod, "ProcessPoolExecutor", _SyncExec)
+                    cls = getattr(mod, cls_name)
+                    if cls_name != "TestExecutor":
+                        cls.setUpClass()
+                    loaded[key] = cls
+                except Exception:
+                    loaded[key] = None
+            cls = loaded[key]
+            if cls is None:
+                continue
             try:
-                mod = importlib.import_module(mod_name)
-                if hasattr(mod, "ProcessPoolExecutor"):
-                    setattr(mod, "ProcessPoolExecutor", _SyncExec)
-                cls = getattr(mod, cls_name)
-                if cls_name != "TestExecutor":
-                    cls.setUpClass()
-                loaded[key] = cls
+                gc.collect()
+                gc.freeze()
+                gc.set_threshold(1_000_000, 50, 100)
+                t0 = time.process_time()
+                res = unittest.TestResult()
+                cls(meth_name).run(res)
+                dt_ms = max(1, round((time.process_time() - t0) * 1000))
+                if res.wasSuccessful():
+                    real_cpu_ms[tid] = dt_ms
             except Exception:
-                loaded[key] = None
-        cls = loaded[key]
-        if cls is None:
-            continue
+                continue
+
+        tpc_c_ms: dict[str, int] = {}
+        if use_c:
+            try:
+                from sqlglot import parse_one
+                from sqlglot.optimizer import optimize
+                from sqlglot.schema import ensure_schema
+                from blast_radius.tpc_verify import load_tpcds_ckpt_stage, verify_tpc_test
+
+                dummy_patch = {"sqlglot/optimizer/optimizer.py": ""}
+                t0 = time.process_time()
+                if verify_tpc_test("tpcds", "fast_a", patched_files=dummy_patch):
+                    tpc_c_ms["exec_fast_a"] = max(50, round((time.process_time() - t0) * 1000))
+
+                s0 = load_tpcds_ckpt_stage(0, for_exec=False)
+                if s0 and s0.get("sqls"):
+                    sch = ensure_schema(s0["schema"])
+                    t0 = time.process_time()
+                    for raw_sql in s0["sqls"]:
+                        if raw_sql:
+                            optimize(parse_one(raw_sql), schema=sch).sql(pretty=True)
+                    tpc_c_ms["opt_tpcds_full"] = max(50, round((time.process_time() - t0) * 1000))
+            except Exception:
+                pass
+
+        with open(out_path, "wb") as handle:
+            marshal.dump({"cpu": real_cpu_ms, "tpc": tpc_c_ms}, handle)
+
+    py_tmp = "/tmp/_br_cal_py.marshal"
+    c_tmp = "/tmp/_br_cal_c.marshal"
+    has_c = load_c_manifest() is not None
+
+    def _spawn(use_c: bool, out_path: str) -> int:
+        pid = os.fork()
+        if pid == 0:
+            try:
+                _run_child(use_c, out_path)
+            finally:
+                os._exit(0)
+        return pid
+
+    # Run Py child first (it updates tpc_meta.pkl if needed), alongside C child in parallel!
+    pid_py = _spawn(False, py_tmp)
+    pid_c = _spawn(True, c_tmp) if has_c else None
+    _, st_py = os.waitpid(pid_py, 0)
+    st_c = os.waitpid(pid_c, 0)[1] if pid_c is not None else 0
+    if st_py != 0 or st_c != 0:
+        raise RuntimeError(f"precompile calibration child failed: py={st_py} c={st_c}")
+
+    py_data = marshal.loads(open(py_tmp, "rb").read())
+    c_data = marshal.loads(open(c_tmp, "rb").read()) if (has_c and os.path.isfile(c_tmp)) else {"cpu": {}, "tpc": {}}
+    for p in (py_tmp, c_tmp):
         try:
-            # Verification children run on a frozen heap (the parent gc.freeze()s before forking):
-            # calibrate the same way, or gc-heavy tests (gc.collect() loops) look ~1000x dearer.
-            gc.collect()
-            gc.freeze()
-            t0 = time.process_time()
-            res = unittest.TestResult()
-            cls(meth_name).run(res)
-            dt_ms = max(1, round((time.process_time() - t0) * 1000))
-            if res.wasSuccessful():
-                real_cpu_ms[tid] = dt_ms
-        except Exception:
-            continue
-    return real_cpu_ms
+            os.unlink(p)
+        except OSError:
+            pass
+    return py_data["cpu"], c_data["cpu"], c_data["tpc"]
 
 
 def _leaf_sqlglot_classes() -> list[str]:
@@ -395,12 +474,14 @@ def main() -> None:
     raw["import_value_attrs"] = [a for a in raw.get("import_value_attrs", []) if a != "EXPRESSION_METADATA"]
     raw["typing_dialects"] = typing_dialects
     raw["pinned_identifiers"] = sorted(pinned_ids)
+    cal_py, cal_c, tpc_c_ms = _calibrate_and_update_tpc_meta(SOURCE, raw["tests"])
     raw["leaf_classes"] = _leaf_sqlglot_classes()
-    cal = _calibrate_and_update_tpc_meta(SOURCE, raw["tests"])
-    # Real cost on a frozen heap (as verification children run) is ~0.4 s; keep a safety margin.
-    cal["tests/test_generator.py::TestGenerator::test_generator_memory"] = 1500
-    cal["tests/dialects/test_dialect.py::TestDialect::test_lazy_load"] = 5
-    raw["real_cpu_ms"] = cal
+    cal_py.setdefault("tests/test_generator.py::TestGenerator::test_generator_memory", 500)
+    cal_py["tests/dialects/test_dialect.py::TestDialect::test_lazy_load"] = 5
+    raw["real_cpu_ms"] = cal_py
+    raw["real_cpu_ms_py"] = cal_py
+    raw["real_cpu_ms_c"] = cal_c
+    raw["tpc_c_ms"] = tpc_c_ms
 
     dict_any: dict[str, int] = defaultdict(int)
     for k, idx in raw.get("dict_keys", {}).items():
@@ -432,7 +513,8 @@ def main() -> None:
         f"precompiled {out_path} in {time.perf_counter() - t0:.1f}s: "
         f"{len(raw['class_refs'])} scoped class_refs, "
         f"{len(raw['typing_dialects'])} typing dialects, "
-        f"{len(raw['real_cpu_ms'])} calibrated tests, "
+        f"{len(raw['real_cpu_ms_py'])} py / {len(raw['real_cpu_ms_c'])} c calibrated tests, "
+        f"tpc_c={tpc_c_ms}, "
         f"{len(raw['leaf_classes'])} leaf classes, "
         f"{out_path.stat().st_size / 1e6:.2f} MB",
         file=sys.stderr,

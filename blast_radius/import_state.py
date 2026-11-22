@@ -183,6 +183,60 @@ def import_all_sqlglot() -> None:
                 pass
 
 
+def import_minimal_sqlglot(mod_names: list[str]) -> None:
+    """Import only `mod_names` (with unittest loaded, matching test runs)."""
+    import importlib
+    import unittest  # noqa: F401
+
+    for name in mod_names:
+        try:
+            importlib.import_module(name)
+        except Exception:
+            pass
+
+
+def _candidate_min_mods(owner: str) -> list[str]:
+    mods: list[str] = []
+    if owner.startswith(("sqlglot.generators.", "sqlglot.parsers.", "sqlglot.typing.")):
+        stem = owner.rsplit(".", 1)[-1]
+        if (SOURCE / "sqlglot" / "dialects" / f"{stem}.py").is_file():
+            mods.append(f"sqlglot.dialects.{stem}")
+    if owner not in mods:
+        mods.append(owner)
+    return mods
+
+
+def _probe_min_batch(items: list[tuple[str, list[str]]]) -> dict[str, str | None]:
+    """Fork a clean child per (owner, mods) before sqlglot is imported in this worker."""
+    sys.path.insert(0, str(SOURCE))
+    out: dict[str, str | None] = {}
+    for owner, mods in items:
+        r_fd, w_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r_fd)
+            d = None
+            try:
+                import_minimal_sqlglot(mods)
+                d = module_digest(owner)
+            except BaseException:
+                d = None
+            finally:
+                os.write(w_fd, marshal.dumps(d))
+                os._exit(0)
+        os.close(w_fd)
+        chunks = []
+        while chunk := os.read(r_fd, 4096):
+            chunks.append(chunk)
+        os.close(r_fd)
+        os.waitpid(pid, 0)
+        try:
+            out[owner] = marshal.loads(b"".join(chunks))
+        except Exception:
+            out[owner] = None
+    return out
+
+
 def main() -> None:
     """Record line owners and owner digests at the pinned commit."""
     src_prefix = str(SOURCE.resolve()) + "/"
@@ -236,15 +290,33 @@ def main() -> None:
         ).stdout
     )
     digests = {name: d for name, d in digests.items() if runtime.get(name) == d}
+
+    # Find owners whose minimal import closure produces the exact same deterministic digest (~15x faster runtime check).
+    cand_items = [(o, _candidate_min_mods(o)) for o in sorted(digests)]
+    min_matches = set(digests)
+    for seed in ("1", "2"):
+        got_min = marshal.loads(
+            subprocess.run(
+                [sys.executable, "-m", "blast_radius.import_state", "--min-worker"],
+                input=marshal.dumps(cand_items),
+                env={**os.environ, "PYTHONHASHSEED": seed},
+                capture_output=True,
+                check=True,
+            ).stdout
+        )
+        min_matches = {o for o in min_matches if got_min.get(o) == digests[o]}
+    min_imports = {o: mods for o, mods in cand_items if o in min_matches}
+
     data = {
         "owners": {rel: {ln: sorted(names) for ln, names in per.items()} for rel, per in owners.items()},
         "digests": digests,
+        "min_imports": min_imports,
         "order": owner_names,
     }
     STATE_FILE.write_bytes(marshal.dumps(data))
     print(
         f"import state: {sum(len(v) for v in owners.values())} lines, {len(owner_names)} owners, "
-        f"{len(data['digests'])} digestable",
+        f"{len(data['digests'])} digestable, {len(min_imports)} minimal",
         file=sys.stderr,
     )
 
@@ -258,5 +330,8 @@ if __name__ == "__main__":
         from blast_radius.verify import import_state_digests
 
         sys.stdout.buffer.write(marshal.dumps(import_state_digests({}, sys.argv[2:])))
+    elif sys.argv[1:2] == ["--min-worker"]:
+        items = marshal.loads(sys.stdin.buffer.read())
+        sys.stdout.buffer.write(marshal.dumps(_probe_min_batch(items)))
     else:
         main()

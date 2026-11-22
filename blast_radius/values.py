@@ -110,8 +110,8 @@ class ValueMap:
         impact,
         header_stop: int | None = None,
     ) -> int | None:
-        """Keep only tests where unchanged logic condition `test_node` ever took truth value `need_truth`."""
-        if not vs.is_logic(test_node):
+        """Keep only tests where unchanged condition `test_node` ever took truth value `need_truth`."""
+        if not isinstance(test_node, ast.expr):
             return None
         _, atoms_t, _ = vs.build(test_node)
         if not vs.instrumentable(atoms_t):
@@ -340,7 +340,9 @@ def site_mutations(
             lo, hi = o.lineno, o.end_lineno
             if type(o) is type(n) and not any(lo <= ln <= hi for ln in touched):
                 return True
-        if isinstance(o, ast.AST) and vs.is_logic(o):
+        if isinstance(o, ast.AST) and (
+            vs.is_logic(o) or (vs.is_bare_test(o, parent, field) and isinstance(n, ast.expr) and vs.is_logic(n))
+        ):
             if isinstance(n, ast.AST) and _dump(o) == _dump(n):
                 return True
             if depth == 0 or not isinstance(n, ast.expr):
@@ -350,7 +352,7 @@ def site_mutations(
                 return False
             muts.append(("logic", o, n, parent, field))
             return True
-        if isinstance(o, ast.IfExp) and isinstance(n, ast.IfExp) and depth > 0 and vs.is_logic(o.test):
+        if isinstance(o, ast.IfExp) and isinstance(n, ast.IfExp) and depth > 0:
             if _dump(o.test) == _dump(n.test):
                 _, atoms_t, _ = vs.build(o.test)
                 if vs.instrumentable(atoms_t):

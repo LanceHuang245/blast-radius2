@@ -13,36 +13,31 @@ RUN mkdir -p /app/sqlglot-src \
     && rm /tmp/sqlglot.tar.gz \
     && python -m compileall -q /app/sqlglot-src
 
-# Native C mypyc build of tokenizer_core and trie for fast test_max_nodes verification (kept separate from pure-Python sqlglot-src).
+# Modular mypyc + Cython build of sqlglot C extension groups under /app/sqlglot-c.
+COPY blast_radius/__init__.py blast_radius/c_loader.py blast_radius/build_c.py /app/blast_radius/
 RUN DEBIAN_FRONTEND=noninteractive apt-get update -qq \
     && apt-get install -y -qq --no-install-recommends gcc libc6-dev \
-    && mkdir -p /app/sqlglot-c \
-    && cp -r /app/sqlglot-src/sqlglot /app/sqlglot-c/sqlglot \
-    && ln -s /app/sqlglot-src/tests /app/sqlglot-c/tests \
-    && cd /app/sqlglot-c \
-    && MYPYPATH=/app/sqlglot-c python -c "import os, sys; from setuptools import setup; from mypyc.build import mypycify; src = '/app/sqlglot-c/sqlglot'; files = [os.path.join(src, f) for f in ('tokenizer_core.py', 'trie.py')]; sys.argv = ['setup.py', 'build_ext', '--inplace', '-j', str(os.cpu_count() or 2)]; setup(name='sqlglotc_leaf', ext_modules=mypycify(files, opt_level='2', debug_level='0', separate=True))" \
-    && rm -rf /app/sqlglot-c/build \
-    && PYTHONPATH=/app/sqlglot-c python -c "import sqlglot, sqlglot.tokenizer_core as tc, sqlglot.trie as tr; assert tc.__file__.endswith('.so') and tr.__file__.endswith('.so')" \
-    && chmod -R a+rX /app/sqlglot-c \
+    && pip install --no-cache-dir cython \
+    && PYTHONPATH=/app python -m blast_radius.build_c \
+    && pip uninstall -y -q cython \
     && apt-get purge -y --auto-remove -qq gcc libc6-dev \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && chmod -R a+rX /app/sqlglot-c
 
-# Precompile TPC baseline and impact.marshal before copying the rest of blast_radius so rebuilds stay cached.
-COPY blast_radius/__init__.py blast_radius/precompile_tpc.py /app/blast_radius/
+# Precompile TPC baseline before copying map/ and the rest of blast_radius so rebuilds stay cached.
+COPY blast_radius/precompile_tpc.py /app/blast_radius/
 RUN mkdir -p /app/map \
     && PYTHONPATH=/app python -m blast_radius.precompile_tpc
 
 COPY map/ /app/map/
-COPY blast_radius/impact_map.py blast_radius/precompile.py /app/blast_radius/
-RUN PYTHONPATH=/app python -m blast_radius.precompile
-
 COPY blast_radius/ /app/blast_radius/
-# Which module's import runs each sqlglot line, and digests of what those imports build.
+# Record pure-Python import state & per-case/DB caches first, then calibrate C + pure-Py costs.
 RUN PYTHONPATH=/app python -m blast_radius.import_state \
     && SKIP_INTEGRATION=0 PYTHONPATH=/app python -m blast_radius.precompile_cases \
+    && PYTHONPATH=/app python -m blast_radius.precompile \
     && python -c "import gzip; open('/app/map/values.marshal', 'wb').write(gzip.decompress(open('/app/map/values.bin', 'rb').read()))" \
     && python -m compileall -q /app/blast_radius \
-    && chmod -R a+rX /app/blast_radius /app/map
+    && chmod -R a+rX /app/blast_radius /app/map /app/sqlglot-c
 
 ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app

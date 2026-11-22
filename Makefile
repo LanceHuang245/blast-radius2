@@ -56,6 +56,6 @@ values:
 		-v $(CURDIR)/tools:/tools:ro -v $(CURDIR):/repo:ro -v $(CURDIR)/.cache/valout:/out \
 		-v $(SAMPLE)/tests.json:/tests.json:ro -w /src -e PYTHONPATH=/src:/tools -e MAP_OUT=/out \
 		-e SKIP_INTEGRATION=0 -e SKIP_IDS=tests/test_parser.py::TestParser::test_max_nodes $(MAP_IMAGE) \
-		sh -c 'python /tools/run_values.py 10 & python /tools/run_values_ids.py 8 x tests/test_parser.py tests/test_optimizer.py; wait'
+		sh -c 'python /tools/run_values.py 10 & python /tools/run_values_ids.py 8 x tests/test_parser.py tests/test_optimizer.py & VALUE_SHARD=maxnodes SKIP_IDS= timeout 180 python -m pytest tests/test_parser.py::TestParser::test_max_nodes -p value_plugin -p no:cacheprovider -q -o addopts= || true; wait'
 	docker run --rm --platform linux/amd64 -v $(CURDIR):/w -w /w $(MAP_IMAGE) \
 		python tools/build_values.py .cache/valout sample/tests.json map/values.bin

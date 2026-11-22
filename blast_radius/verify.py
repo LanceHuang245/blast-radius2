@@ -39,6 +39,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from blast_radius import SOURCE, SOURCE_C, log
+from blast_radius.c_loader import (
+    PURE_PYTHON_ONLY_TESTS,
+    disabled_groups_for,
+    install_modular_c,
+    load_c_manifest,
+    phase2_c_bucket,
+)
+from blast_radius.db_cache import install_db_cache, wrap_duckdb_if_loaded
 from blast_radius.impact_map import module_name
 from blast_radius.schedule import split_with_cost
 from blast_radius.select import Selection
@@ -49,10 +57,12 @@ from blast_radius.tpc_verify import (
     TPC_SUITE_BY_TEST_ID,
     est_tpc_fast_a_ms,
     est_tpc_mode_ms,
+    load_tpcds_ckpts_meta,
     select_tpc_mode,
     select_tpcds_ckpt,
     select_tpcds_span,
     tokenizer_edit_position_free,
+    tokenizer_edit_touches_max_nodes,
     verify_generator_memory,
     verify_lazy_athena_presto,
     verify_max_nodes,
@@ -66,17 +76,17 @@ MAX_SINGLE_TEST_MS = int(os.environ.get("BR_MAX_SINGLE_MS", "6000"))
 MAX_COMMIT_VERIFY_MS = int(os.environ.get("BR_MAX_COMMIT_MS", "6000"))
 MIN_GAIN_MS = int(os.environ.get("BR_MIN_GAIN_MS", "300"))
 MIN_DECAP_GAIN_MS = int(os.environ.get("BR_MIN_DECAP_GAIN_MS", "550"))
-MIN_ROI_RATIO = float(os.environ.get("BR_MIN_ROI_RATIO", "1.40"))
+MIN_ROI_RATIO = float(os.environ.get("BR_MIN_ROI_RATIO", "1.20"))
 VERIFY_FIXTURE_MAX_MS = int(os.environ.get("BR_FIXTURE_MAX_MS", "0"))
 TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "150000"))
 ENABLE_HOTPATCH = os.environ.get("BR_ENABLE_HOTPATCH", "1") != "0"
 # Tail verification (Step 2c) limits: how much CPU a child may spend dropping passing tests.
-STEP2C_ROUNDS = int(os.environ.get("BR_STEP2C_ROUNDS", "5"))
-STEP2C_EST_CAP_MS = int(os.environ.get("BR_STEP2C_EST_MS", "5000"))
+STEP2C_ROUNDS = int(os.environ.get("BR_STEP2C_ROUNDS", "10"))
+STEP2C_EST_CAP_MS = int(os.environ.get("BR_STEP2C_EST_MS", "12000"))
 STEP2C_CPU_S = float(os.environ.get("BR_STEP2C_CPU_S", "12.0"))
 STEP2C_FAIL_ROI = float(os.environ.get("BR_STEP2C_FAIL_ROI", "2.5"))
 STEP2C_KEEP_AFTER_FAIL = os.environ.get("BR_STEP2C_KEEP_AFTER_FAIL", "0") != "0"
-DECAP_CPU_RATIO = float(os.environ.get("BR_DECAP_CPU_RATIO", "0.75"))
+DECAP_CPU_RATIO = float(os.environ.get("BR_DECAP_CPU_RATIO", "0.85"))
 # Weight of a CPU millisecond against a simulated millisecond when choosing what to verify
 # (1.0: break-even on the score; below 1: spend CPU to cut simulated time further).
 CPU_WEIGHT = float(os.environ.get("BR_CPU_WEIGHT", "1.0"))
@@ -90,20 +100,9 @@ ENABLE_TPC_FAST_B = os.environ.get("BR_ENABLE_TPC_FAST_B", "1") != "0"
 TPC_PROBE_BUDGET_MS = int(os.environ.get("BR_TPC_PROBE_MS", "300"))
 TPC_MIN_GAIN_MS = int(os.environ.get("BR_TPC_MIN_GAIN_MS", "1800"))
 MAX_PARALLEL_CHILDREN = int(os.environ.get("BR_PARALLEL", "2"))
-# Safety factor on the dedicated verifiers' (TPC, max_nodes, ...) CPU estimates; per-test
-# estimates get BR_CPU_SCALE in __main__ (practice showed those too optimistic: c624afb spent
-# +35 s CPU for -22 s simulated).
 SPECIAL_CPU_SCALE = float(os.environ.get("BR_SPECIAL_CPU_SCALE", "1.0"))
 FAST_B_MAX_EST_MS = int(os.environ.get("BR_FAST_B_MAX_MS", "6500"))
-ENABLE_MYPYC = os.environ.get("BR_MYPYC", "1") != "0" and (SOURCE_C / "sqlglot").is_dir()
-
-# Tokenizer C leaves compiled via mypyc in /app/sqlglot-c for non-position-free test_max_nodes.
-LEAF_COMPILED_FILES = frozenset({
-    "sqlglot/tokenizer_core.py",
-    "sqlglot/trie.py",
-})
-
-PURE_PYTHON_ONLY_TESTS: frozenset[str] = frozenset()
+ENABLE_MYPYC = os.environ.get("BR_MYPYC", "1") != "0" and load_c_manifest() is not None
 
 # Hard wall-clock limits, enforced by the parent (the run itself has 3 minutes, 4.5 in the final).
 CHILD_LIMIT_BASE_S = 8.0
@@ -167,7 +166,11 @@ class VerifyTask:
     tpc_query_mask: dict[int, int] = field(default_factory=dict)
     tpc_s2b_query_mask: dict[int, int] = field(default_factory=dict)
     cpu_override: dict[int, int] = field(default_factory=dict)
-    use_mypyc: bool = False
+    disabled_c_groups: frozenset[str] = field(default_factory=frozenset)
+    c_bucket: str = "fallback_c"
+    c_exec_fast: bool = False
+    pure_py_decap: list[int] = field(default_factory=list)
+    tok_untouched: bool = False
 
 
 class _LazyFuture(cf.Future):
@@ -335,9 +338,12 @@ def _raise_timeout(signum, frame):
 IMPORT_STATE_LIMIT_S = 6.0
 
 
-def import_state_digests(patched_files: dict[str, str], names: list[str]) -> dict[str, str | None]:
-    """Import every sqlglot module with the patch in a forked child and digest `names`
-    (see blast_radius.import_state). Empty if the child fails."""
+def import_state_digests(
+    patched_files: dict[str, str],
+    names: list[str],
+    minimal_mods: list[str] | None = None,
+) -> dict[str, str | None]:
+    """Import sqlglot modules (minimal closure when safe, else all) with patch in a forked child and digest `names`."""
     gc.freeze()
     r_fd, w_fd = os.pipe()
     pid = os.fork()
@@ -355,11 +361,12 @@ def import_state_digests(patched_files: dict[str, str], names: list[str]) -> dic
             sys.path.insert(0, str(SOURCE))
             sys.meta_path.insert(0, _OverlayFinder(patched_files))
             _install_open_overlay(patched_files)
-            from blast_radius.import_state import digests_for, import_all_sqlglot
+            from blast_radius.import_state import digests_for, import_all_sqlglot, import_minimal_sqlglot
 
-            # Import everything, as the build did: importing only the owners builds different
-            # state for some of them (generators.duckdb), which would hide every narrowing.
-            import_all_sqlglot()
+            if minimal_mods is not None:
+                import_minimal_sqlglot(minimal_mods)
+            else:
+                import_all_sqlglot()
             payload = marshal.dumps(digests_for(names))
         except BaseException:
             pass
@@ -395,9 +402,16 @@ def check_import_state(patched_files: dict[str, str], owners: list[str]) -> bool
     if _IMPORT_DIGESTS is None:
         from blast_radius.import_state import STATE_FILE
 
-        _IMPORT_DIGESTS = marshal.loads(STATE_FILE.read_bytes())["digests"]
-    got = import_state_digests(patched_files, owners)
-    return all(name in _IMPORT_DIGESTS and got.get(name) == _IMPORT_DIGESTS[name] for name in owners)
+        _IMPORT_DIGESTS = marshal.loads(STATE_FILE.read_bytes())
+    digests = _IMPORT_DIGESTS["digests"]
+    min_imports = _IMPORT_DIGESTS.get("min_imports") or {}
+    minimal_mods = (
+        sorted({m for owner in owners for m in min_imports[owner]})
+        if owners and all(owner in min_imports for owner in owners)
+        else None
+    )
+    got = import_state_digests(patched_files, owners, minimal_mods=minimal_mods)
+    return all(name in digests and got.get(name) == digests[name] for name in owners)
 
 
 def _find_unique_code(parent_code: types.CodeType, steps: list[str]) -> types.CodeType | None:
@@ -457,8 +471,10 @@ def _apply_code_hotpatch(
     patched_files: dict[str, str],
     targets: list[tuple[str, str]],
     hot_patch_spans: dict[tuple[str, str], tuple[int, int, bool]] | None = None,
+    default_hot_targets: list[tuple[str, str, tuple | None, dict | None]] | None = None,
 ) -> bool:
-    """Swap __code__ in-place on live sqlglot functions inside the forked Phase-2 child."""
+    """Swap __code__ (and literal defaults) in-place on live sqlglot functions inside the forked Phase-2 child."""
+    def_map = {(p, q): (defs, kwdefs) for p, q, defs, kwdefs in (default_hot_targets or ())}
     by_path: dict[str, list[str]] = {}
     for rel_path, qualname in targets:
         by_path.setdefault(rel_path, []).append(qualname)
@@ -511,6 +527,10 @@ def _apply_code_hotpatch(
             ):
                 return False
             fn.__code__ = new_code
+            if (rel_path, qualname) in def_map:
+                new_defs, new_kwdefs = def_map[(rel_path, qualname)]
+                fn.__defaults__ = new_defs
+                fn.__kwdefaults__ = new_kwdefs
     return True
 
 
@@ -529,10 +549,25 @@ def _apply_attr_hotpatch(targets: list[tuple[str, str, str, object]]) -> bool:
     return True
 
 
+def _closure_refs_target(fn, old_val) -> bool:
+    if not callable(fn):
+        return False
+    for cell in getattr(fn, "__closure__", None) or ():
+        try:
+            cval = cell.cell_contents
+            if cval is old_val or cval == old_val:
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def _apply_dict_hotpatch(
     targets: list[tuple[str, str, str, list[str], list[tuple[str, str]]]],
 ) -> bool:
-    """Update non-import-time tracked dict entries on leaf classes in-place inside Phase-2 child."""
+    """Update non-import-time tracked dict entries (and safely copied subclass dicts) in Phase-2 child."""
+    updates: list[tuple[type, str, dict]] = []
+    cache_clears: list[type] = []
     for rel_path, cls_qual, attr_name, removed_keys, set_items in targets:
         mod = importlib.import_module(module_name(rel_path))
         container: object = mod
@@ -540,32 +575,93 @@ def _apply_dict_hotpatch(
             container = container.__dict__.get(part) if hasattr(container, "__dict__") else None
             if container is None:
                 return False
-        if not isinstance(container, type) or any(
-            s.__module__.startswith("sqlglot") for s in container.__subclasses__()
-        ):
+        if not isinstance(container, type):
             return False
         cur = container.__dict__.get(attr_name)
         if not isinstance(cur, dict):
             return False
         new_d = dict(cur)
         filename = str((Path(os.getcwd()) / rel_path).resolve())
+        eval_removed = []
+        eval_set = []
         try:
             for k_src in removed_keys:
                 k = eval(compile(k_src, filename, "eval"), mod.__dict__)
                 if k not in new_d:
                     return False
+                eval_removed.append(k)
                 del new_d[k]
             for k_src, v_src in set_items:
                 k = eval(compile(k_src, filename, "eval"), mod.__dict__)
                 v = eval(compile(v_src, filename, "eval"), mod.__dict__)
+                eval_set.append((k, v))
                 new_d[k] = v
         except Exception:
             return False
-        setattr(container, attr_name, new_d)
+
+        updates.append((container, attr_name, new_d))
         if attr_name == "TRANSFORMS":
-            gen_mod = sys.modules.get("sqlglot.generator")
-            if gen_mod is not None and hasattr(gen_mod, "_DISPATCH_CACHE"):
-                gen_mod._DISPATCH_CACHE.pop(container, None)
+            cache_clears.append(container)
+
+        # Propagate changed/added/removed entries to sqlglot subclasses that copied parent's dict.
+        subs: list[type] = []
+        seen_subs: set[type] = {container}
+        queue = list(container.__subclasses__())
+        while queue:
+            sub = queue.pop(0)
+            if sub in seen_subs or not sub.__module__.startswith("sqlglot"):
+                continue
+            seen_subs.add(sub)
+            subs.append(sub)
+            queue.extend(sub.__subclasses__())
+
+        for sub in subs:
+            if attr_name == "TRANSFORMS":
+                cache_clears.append(sub)
+            if attr_name not in sub.__dict__:
+                continue
+            sub_d = sub.__dict__[attr_name]
+            if sub_d is cur:
+                updates.append((sub, attr_name, new_d))
+                continue
+            if not isinstance(sub_d, dict):
+                return False
+            new_sub = dict(sub_d)
+            changed = False
+            try:
+                for k in eval_removed:
+                    if k in new_sub:
+                        if new_sub[k] == cur[k]:
+                            del new_sub[k]
+                            changed = True
+                        elif _closure_refs_target(new_sub[k], cur[k]):
+                            return False
+                for k, v in eval_set:
+                    if k in cur:
+                        if k in new_sub:
+                            if new_sub[k] == cur[k]:
+                                new_sub[k] = v
+                                changed = True
+                            elif _closure_refs_target(new_sub[k], cur[k]):
+                                return False
+                    elif k not in new_sub:
+                        new_sub[k] = v
+                        changed = True
+            except Exception:
+                return False
+            if changed:
+                updates.append((sub, attr_name, new_sub))
+
+    try:
+        for cls_obj, attr_name, dict_val in updates:
+            setattr(cls_obj, attr_name, dict_val)
+    except TypeError:
+        return False
+    gen_mod = sys.modules.get("sqlglot.generator")
+    if gen_mod is not None and hasattr(gen_mod, "_DISPATCH_CACHE"):
+        dcache = gen_mod._DISPATCH_CACHE
+        for cls_obj in cache_clears:
+            dcache.pop(cls_obj, None)
     return True
 
 
@@ -857,9 +953,24 @@ def _est_test_cpu_ms(
     cpu_by_number: dict[int, int],
     tpc_query_mask: dict[int, int] | None = None,
     tpc_s2b_query_mask: dict[int, int] | None = None,
+    c_exec_fast: bool = False,
+    tok_untouched: bool | None = None,
+    leaf_compiled: bool = False,
+    tpc_c_ms: dict[str, int] | None = None,
 ) -> int:
     """Return the CPU estimate (ms) for verifying test `num` on `sel`, safety factor included."""
-    special = _special_cpu_ms(num, tid, sel, tpc_mode, tpc_query_mask, tpc_s2b_query_mask)
+    special = _special_cpu_ms(
+        num,
+        tid,
+        sel,
+        tpc_mode,
+        tpc_query_mask,
+        tpc_s2b_query_mask,
+        c_exec_fast=c_exec_fast,
+        tok_untouched=tok_untouched,
+        leaf_compiled=leaf_compiled,
+        tpc_c_ms=tpc_c_ms,
+    )
     # cpu_by_number already carries BR_CPU_SCALE (applied in __main__); dedicated verifiers'
     # estimates are measured end to end and use their own factor.
     return cpu_by_number[num] if special is None else round(special * SPECIAL_CPU_SCALE)
@@ -872,6 +983,10 @@ def _special_cpu_ms(
     tpc_mode: str | None,
     tpc_query_mask: dict[int, int] | None,
     tpc_s2b_query_mask: dict[int, int] | None = None,
+    c_exec_fast: bool = False,
+    tok_untouched: bool | None = None,
+    leaf_compiled: bool = False,
+    tpc_c_ms: dict[str, int] | None = None,
 ) -> int | None:
     """Raw CPU estimate for tests with a dedicated fast verifier, else None."""
     if tid == LAZY_LOAD_TEST_ID and "tests/dialects/test_dialect.py" not in sel.patched_files:
@@ -881,7 +996,7 @@ def _special_cpu_ms(
         q_mask = tpc_query_mask.get(num) if tpc_query_mask is not None else None
         s2b_mask = tpc_s2b_query_mask.get(num) if tpc_s2b_query_mask is not None else None
         total_q = 99 if suite == "tpcds" else 22
-        return est_tpc_mode_ms(
+        est = est_tpc_mode_ms(
             suite,
             tpc_mode,
             sel.patched_files,
@@ -891,26 +1006,25 @@ def _special_cpu_ms(
             edited_spans=sel.edited_spans,
             s2b_mask=s2b_mask,
             s1_mask=q_mask,
+            c_exec_fast=c_exec_fast,
         )
+        if suite == "tpcds" and tpc_mode == "fast_a" and c_exec_fast and tpc_c_ms and "exec_fast_a" in tpc_c_ms:
+            if q_mask is None:
+                est = min(est, tpc_c_ms["exec_fast_a"])
+        return est
     if tid == OPT_TPCH_TEST_ID and _can_fast_opt_tpch(sel):
-        return 100
+        return 75 if c_exec_fast else 100
     if tid == MAX_NODES_TEST_ID and _can_fast_max_nodes(sel):
-        tok_touched = any(p in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py") for p in sel.patched_files)
-        if tok_touched and not tokenizer_edit_position_free(sel):
-            if (
-                ENABLE_MYPYC
-                and "sqlglot/tokenizer_core.py" not in sel.patched_files
-                and not any(p in LEAF_COMPILED_FILES for p in sel.patched_files)
-            ):
-                return 2000
-            return 16500
-        return 400
+        is_untouched = (not tokenizer_edit_touches_max_nodes(sel)) if tok_untouched is None else tok_untouched
+        if is_untouched or tokenizer_edit_position_free(sel):
+            return 45
+        if leaf_compiled:
+            return 1500
+        return 16500
     if tid == GEN_MEM_TEST_ID:
         can_fast, is_scoped = _can_fast_gen_mem(sel)
         if can_fast:
-            # Scoped: only the affected dialects. Core edits: every dialect (the real test),
-            # measured ~0.4 s on a frozen heap; margin for a slower host.
-            return 550 if is_scoped else 1500
+            return 450 if is_scoped else 550
     return None
 
 
@@ -927,13 +1041,13 @@ def _best_drop_prefix(
     ms_by_number: dict[int, int],
     cpu_by_number: dict[int, int],
     min_gain: int,
-    limit: int = 200,
+    limit: int = 0,
     id_by_number: dict[int, str] | None = None,
     per_mod_ms: int = 0,
     min_roi: float = MIN_ROI_RATIO,
 ) -> list[int]:
-    """Candidates worth verifying to drop from `pool`: the prefix, cheapest CPU per saved ms
-    first, with the best net (cost saved minus CPU spent), if net >= min_gain and saved >= spent * min_roi."""
+    """Candidates worth verifying to drop from `pool`: scans ALL candidates across 3 orderings
+    (ratio, module-grouped, descending sim) returning the prefix with best net gain."""
     cand_set = set(candidates)
     if not cand_set:
         return []
@@ -945,41 +1059,67 @@ def _best_drop_prefix(
         cand_list = list(cand_set)
     if not cand_list:
         return []
-    order = sorted(
-        cand_list,
-        key=lambda n: (
+
+    def _ratio_key(n: int):
+        return (
             1 if ms_by_number[n] == 0 else 0,
             cpu_by_number[n] / max(ms_by_number[n], 1),
             -ms_by_number[n],
             n,
-        ),
-    )
-    desc = sorted(pool, key=lambda n: -ms_by_number[n])
-    total = sum(ms_by_number[n] for n in pool)
-    count = len(pool)
-    current = _lb_cost(total, ms_by_number[desc[0]] if desc else 0, count)
-    removed: set[int] = set()
-    seen_mods: set[str] = set()
-    best_net, best, prefix, spent, top = min_gain - 1, [], [], 0, 0
-    # Allow seeing the count==0 worker-startup cliff on clean commits with 201..600 tests.
-    scan_limit = max(limit, len(pool)) if len(pool) <= 600 else limit
-    for num in order[:scan_limit]:
-        removed.add(num)
-        prefix.append(num)
-        total -= ms_by_number[num]
-        count -= 1
-        spent += cpu_by_number[num]
-        if per_mod_ms and id_by_number is not None:
-            mod_file = id_by_number[num].split("::", 1)[0]
-            if mod_file not in seen_mods:
-                seen_mods.add(mod_file)
-                spent += per_mod_ms
-        while top < len(desc) and desc[top] in removed:
-            top += 1
-        saved = current - _lb_cost(total, ms_by_number[desc[top]] if top < len(desc) else 0, count)
-        net = saved - spent * CPU_WEIGHT
-        if net > best_net and saved >= spent * min_roi * CPU_WEIGHT:
-            best_net, best = net, list(prefix)
+        )
+
+    order_ratio = sorted(cand_list, key=_ratio_key)
+    orderings: list[list[int]] = [order_ratio]
+
+    if per_mod_ms and id_by_number is not None:
+        by_mod: dict[str, list[int]] = {}
+        for n in order_ratio:
+            by_mod.setdefault(id_by_number[n].split("::", 1)[0], []).append(n)
+        if len(by_mod) > 1:
+            mod_keys: list[tuple] = []
+            for mod, nums in by_mod.items():
+                s_ms = sum(ms_by_number[n] for n in nums)
+                s_cpu = sum(cpu_by_number[n] for n in nums) + per_mod_ms
+                mod_keys.append((1 if s_ms == 0 else 0, s_cpu / max(s_ms, 1), -s_ms, mod))
+            mod_keys.sort()
+            order_mod = [n for _, _, _, mod in mod_keys for n in by_mod[mod]]
+            if order_mod != order_ratio:
+                orderings.append(order_mod)
+
+    order_desc = sorted(cand_list, key=lambda n: (-ms_by_number[n], cpu_by_number[n], n))
+    if order_desc != order_ratio:
+        orderings.append(order_desc)
+
+    desc = sorted(pool, key=lambda n: (-ms_by_number[n], n))
+    pool_total = sum(ms_by_number[n] for n in pool)
+    pool_count = len(pool)
+    current = _lb_cost(pool_total, ms_by_number[desc[0]] if desc else 0, pool_count)
+
+    best_net = min_gain - 1
+    best: list[int] = []
+    for order in orderings:
+        scan = order if limit <= 0 else order[: max(limit, len(order))]
+        removed: set[int] = set()
+        seen_mods: set[str] = set()
+        prefix: list[int] = []
+        total, count, spent, top = pool_total, pool_count, 0, 0
+        for num in scan:
+            removed.add(num)
+            prefix.append(num)
+            total -= ms_by_number[num]
+            count -= 1
+            spent += cpu_by_number[num]
+            if per_mod_ms and id_by_number is not None:
+                mod_file = id_by_number[num].split("::", 1)[0]
+                if mod_file not in seen_mods:
+                    seen_mods.add(mod_file)
+                    spent += per_mod_ms
+            while top < len(desc) and desc[top] in removed:
+                top += 1
+            saved = current - _lb_cost(total, ms_by_number[desc[top]] if top < len(desc) else 0, count)
+            net = saved - spent * CPU_WEIGHT
+            if net > best_net and saved >= spent * min_roi * CPU_WEIGHT:
+                best_net, best = net, list(prefix)
     return best
 
 
@@ -994,12 +1134,28 @@ def _has_decap_prefix_roi(
     cpu_by_number: dict[int, int],
     tpc_query_mask: dict[int, int] | None = None,
     tpc_s2b_query_mask: dict[int, int] | None = None,
+    c_exec_fast: bool = False,
+    tok_untouched: bool | None = None,
+    leaf_compiled: bool = False,
+    tpc_c_ms: dict[str, int] | None = None,
 ) -> bool:
     """Check if the tallest remaining decap target `elig_rem[0]` belongs to a net-profitable prefix."""
     if not elig_rem:
         return False
     num = elig_rem[0]
-    t_cpu = _est_test_cpu_ms(num, id_by_number[num], sel, tpc_mode, cpu_by_number, tpc_query_mask, tpc_s2b_query_mask)
+    t_cpu = _est_test_cpu_ms(
+        num,
+        id_by_number[num],
+        sel,
+        tpc_mode,
+        cpu_by_number,
+        tpc_query_mask,
+        tpc_s2b_query_mask,
+        c_exec_fast=c_exec_fast,
+        tok_untouched=tok_untouched,
+        leaf_compiled=leaf_compiled,
+        tpc_c_ms=tpc_c_ms,
+    )
     cur_c, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
     min_req = MIN_DECAP_GAIN_MS if failed else MIN_GAIN_MS
     trial = set(cur_pool)
@@ -1007,7 +1163,17 @@ def _has_decap_prefix_roi(
     for cand in elig_rem:
         trial.discard(cand)
         acc_cpu += _est_test_cpu_ms(
-            cand, id_by_number[cand], sel, tpc_mode, cpu_by_number, tpc_query_mask, tpc_s2b_query_mask
+            cand,
+            id_by_number[cand],
+            sel,
+            tpc_mode,
+            cpu_by_number,
+            tpc_query_mask,
+            tpc_s2b_query_mask,
+            c_exec_fast=c_exec_fast,
+            tok_untouched=tok_untouched,
+            leaf_compiled=leaf_compiled,
+            tpc_c_ms=tpc_c_ms,
         )
         after_c, _ = split_with_cost([(ms_by_number[n], n) for n in trial])
         if (cur_c - after_c) - acc_cpu >= min_req:
@@ -1055,7 +1221,7 @@ def _start_child_verification(
         _SKIP_POOL_PICKLE = not any(
             p in ("sqlglot/serde.py", "sqlglot/expressions/core.py") for p in task.selection.patched_files
         )
-        root = SOURCE_C if task.use_mypyc else SOURCE
+        root = SOURCE
         os.chdir(root)
         if str(root) not in sys.path:
             sys.path.insert(0, str(root))
@@ -1073,12 +1239,20 @@ def _start_child_verification(
         # not hang the child until the parent's much longer backstop kill.
         signal.signal(signal.SIGALRM, _alarm_handler)
 
+        manifest = load_c_manifest() if ENABLE_MYPYC else None
+        all_c_groups = frozenset(manifest.get("groups", ())) if manifest else frozenset()
+        c_enabled = bool(all_c_groups - task.disabled_c_groups)
+        leaf_compiled = manifest is not None and ("leaf" not in task.disabled_c_groups)
+
         lazy_load_ok: bool | None = None
         if task.phase == 1:
             if "sqlglot" in sys.modules:
                 for k in [m for m in sys.modules if m == "sqlglot" or m.startswith(("sqlglot.", "tests."))]:
                     sys.modules.pop(k, None)
             sys.meta_path.insert(0, _OverlayFinder(task.selection.patched_files, root=root))
+            if c_enabled:
+                install_modular_c(task.disabled_c_groups, after_overlay=True)
+            install_db_cache()
             _install_open_overlay(task.selection.patched_files)
             if (
                 "tests/dialects/test_dialect.py" not in task.selection.patched_files
@@ -1101,12 +1275,15 @@ def _start_child_verification(
                 finally:
                     signal.alarm(0)
         else:
+            install_db_cache()
+            wrap_duckdb_if_loaded()
             _install_open_overlay(task.selection.patched_files)
             if task.selection.hot_patch_targets:
                 if not _apply_code_hotpatch(
                     task.selection.patched_files,
                     task.selection.hot_patch_targets,
                     task.selection.hot_patch_spans,
+                    task.selection.default_hot_targets,
                 ):
                     os.write(w_fd, b"FAIL_PATCH")
                     os.close(w_fd)
@@ -1152,6 +1329,7 @@ def _start_child_verification(
             try:
                 if key not in loaded_classes:
                     mod = importlib.import_module(mod_name)
+                    wrap_duckdb_if_loaded()
                     loaded_mods[mod_name] = mod
                     if mod_name in ("tests.test_optimizer", "tests.test_executor"):
                         _patch_pool_references()
@@ -1165,6 +1343,7 @@ def _start_child_verification(
                     loaded_classes[key] = cls
                     if cls not in setup_done:
                         cls.setUpClass()
+                        wrap_duckdb_if_loaded()
                         setup_done.add(cls)
                 cls = loaded_classes[key]
                 sub_spec = task.subtest_filter.get(num)
@@ -1259,7 +1438,11 @@ def _start_child_verification(
             if tid == MAX_NODES_TEST_ID and _can_fast_max_nodes(sel):
                 signal.alarm(60)
                 try:
-                    return verify_max_nodes(sel.patched_files, position_free=tokenizer_edit_position_free(sel))
+                    return verify_max_nodes(
+                        sel.patched_files,
+                        position_free=tokenizer_edit_position_free(sel),
+                        tok_untouched=task.tok_untouched,
+                    )
                 except BaseException:
                     return False
                 finally:
@@ -1313,14 +1496,58 @@ def _start_child_verification(
             n
             for n in (task.chosen - passed)
             if id_by_number[n] not in SUBPROCESS_TESTS
-            and not (task.use_mypyc and id_by_number[n] in PURE_PYTHON_ONLY_TESTS)
+            and not (c_enabled and id_by_number[n] in PURE_PYTHON_ONLY_TESTS)
         }
+        opt_tpcds_nums = [n for n in verifiable if id_by_number[n] == OPT_TPCDS_TEST_ID]
         decap_set = set(task.decap_targets) & verifiable
+
+        def _propagate_fast_a_to_opt_tpcds() -> None:
+            if not tpcds_unchanged or not opt_tpcds_nums:
+                return
+            opt_n = opt_tpcds_nums[0]
+            if opt_n in passed or opt_n in failed:
+                return
+            fa_span = select_tpcds_span(sel.patched_files, max_start=14, for_exec=True, edited_spans=sel.edited_spans)
+            opt_span = select_tpcds_span(sel.patched_files, max_start=14, for_exec=False, edited_spans=sel.edited_spans)
+            if fa_span is None or opt_span is None or opt_span[1] is None:
+                return
+            opt_stop = opt_span[1]
+            fa_stop = fa_span[1]
+            can_skip = opt_stop == 0 or (
+                opt_stop <= 7
+                and fa_stop is not None
+                and opt_stop <= fa_stop
+                and all("leave_tables_isolated" not in (s or "") for s in sel.patched_files.values())
+            )
+            if not can_skip:
+                return
+            if opt_n in task.case_filter:
+                all_q = {idx for _, idx in task.case_filter[opt_n]}
+            else:
+                meta = load_tpcds_ckpts_meta()
+                q_ms = (meta.get("s2b_query_ms") or {}).get("tpcds") if meta else None
+                if not q_ms:
+                    return
+                all_q = set(range(len(q_ms)))
+            rem_q = all_q - tpcds_unchanged
+            if not rem_q:
+                _mark(opt_n, True)
+            elif len(rem_q) < len(all_q):
+                cpu_by_number[opt_n] = max(30, cpu_by_number[opt_n] * len(rem_q) // max(len(all_q), 1))
 
         if decap_set:
             total_decap_cpu = sum(
                 _est_test_cpu_ms(
-                    n, id_by_number[n], sel, task.tpc_mode, cpu_by_number, task.tpc_query_mask, task.tpc_s2b_query_mask
+                    n,
+                    id_by_number[n],
+                    sel,
+                    task.tpc_mode,
+                    cpu_by_number,
+                    task.tpc_query_mask,
+                    task.tpc_s2b_query_mask,
+                    c_exec_fast=task.c_exec_fast,
+                    tok_untouched=task.tok_untouched,
+                    leaf_compiled=leaf_compiled,
                 )
                 for n in decap_set
             )
@@ -1331,9 +1558,6 @@ def _start_child_verification(
                 and max(other_cpus) <= MAX_SINGLE_TEST_MS
                 and sum(other_cpus) <= MAX_COMMIT_VERIFY_MS
             )
-            # Only run a pre-decap fail-fast probe when a probe failure can actually block an
-            # expensive non-fast_a TPC decap target (or when the remaining tail will be verified).
-            # Cap at <=5 tests and <=2 modules (preferring already-loaded modules) to avoid mass imports.
             has_blockable_decap = False and any(
                 id_by_number[n] in TPC_SUITE_BY_TEST_ID
                 and TPC_SUITE_BY_TEST_ID[id_by_number[n]] == "tpcds"
@@ -1374,21 +1598,17 @@ def _start_child_verification(
             # Step 2b: Makespan & worker-collapsing decapitation. Never block test_execute_tpch
             # (fast & high ROI even in full_cached) or fast_a TPC after a unit-test failure.
             def _tpc_blocked_after_fail(n: int) -> bool:
-                if not failed:
-                    return False
-                tid_n = id_by_number[n]
-                if tid_n not in TPC_SUITE_BY_TEST_ID:
-                    return False
-                # Practice commits nearly all break some small test, yet test_execute_tpcds
-                # usually still passes: a failed unit test says nothing about the TPC suite.
-                # Blocking here kept the 21.45 s test on every fast_b/full_cached commit.
                 return False
 
             decap_ordered = [n for n in task.decap_targets if n in decap_set]
             for idx, num in enumerate(decap_ordered):
+                if num in passed or num in failed:
+                    continue
                 if _tpc_blocked_after_fail(num):
                     continue
-                elig_rem = [x for x in decap_ordered[idx:] if not _tpc_blocked_after_fail(x)]
+                elig_rem = [x for x in decap_ordered[idx:] if x not in passed and x not in failed and not _tpc_blocked_after_fail(x)]
+                if not elig_rem:
+                    continue
                 cur_pool = task.chosen - passed
                 if not _has_decap_prefix_roi(
                     cur_pool,
@@ -1401,31 +1621,83 @@ def _start_child_verification(
                     cpu_by_number,
                     task.tpc_query_mask,
                     task.tpc_s2b_query_mask,
+                    c_exec_fast=task.c_exec_fast,
+                    tok_untouched=task.tok_untouched,
+                    leaf_compiled=leaf_compiled,
                 ):
                     continue
-                _mark(num, _run_candidate(num))
+                ok_d = _mark(num, _run_candidate(num))
+                if (
+                    ok_d
+                    and task.tpc_mode == "fast_a"
+                    and TPC_SUITE_BY_TEST_ID.get(id_by_number[num]) == "tpcds"
+                ):
+                    _propagate_fast_a_to_opt_tpcds()
 
-        # Step 2c: the tail, as the best ROI prefix of what is still unverified, re-planned after
-        # each failure with adaptive throttling and a deterministic estimated CPU cap.
+        # Step 2c: the tail, seeded by up to 4 tiny high-affinity probes when >=15 tests remain,
+        # using Bayesian dynamic pass-rate ROI and continuing across multi-worker collapses.
         blocked_decap: set[int] = set()
         fix_narrow_only = sel.fixture_only and not VERIFY_FIXTURE_MAX_MS
         if not fix_narrow_only or (sel.fixture_changed_pairs and task.case_filter):
             per_mod_ms = 20 if task.phase == 1 else 4
             step2c_t0 = time.process_time()
             step2c_est_ms = 0
-            s2c_failed = 0
-            s2c_passed = 0
+            s2c_failed = len(failed)
+            s2c_passed = len(passed)
+
+            rem_s2c_init = verifiable - passed - failed - blocked_decap
+            if len(rem_s2c_init) >= 15 and not s2c_failed and not fix_narrow_only:
+                edited_stems = {
+                    Path(p).stem.lower()
+                    for p in sel.patched_files
+                    if p.endswith(".py")
+                } - {"__init__", "core", "dialect", "optimizer", "parser", "generator", "expressions", "errors", "helper", "tokens"}
+                if edited_stems:
+                    affinity_cands = [
+                        n
+                        for n in rem_s2c_init
+                        if cpu_by_number[n] <= 8
+                        and id_by_number[n] not in (LAZY_LOAD_TEST_ID, OPT_TPCH_TEST_ID, MAX_NODES_TEST_ID, GEN_MEM_TEST_ID)
+                        and id_by_number[n] not in TPC_SUITE_BY_TEST_ID
+                        and not id_by_number[n].startswith("tests/test_dialect_imports.py::")
+                        and any(st in id_by_number[n].lower() for st in edited_stems)
+                    ]
+                    affinity_cands.sort(
+                        key=lambda n: (
+                            0 if id_by_number[n].split("::", 1)[0][:-3].replace("/", ".") in sys.modules else 1,
+                            cpu_by_number[n],
+                            ms_by_number[n],
+                            id_by_number[n],
+                        )
+                    )
+                    for num in affinity_cands[:4]:
+                        step2c_est_ms += cpu_by_number[num]
+                        if _mark(num, _run_candidate(num)):
+                            s2c_passed += 1
+                        else:
+                            s2c_failed += 1
+                            break
+
             for _ in range(STEP2C_ROUNDS):
                 if step2c_est_ms > STEP2C_EST_CAP_MS or time.process_time() - step2c_t0 > STEP2C_CPU_S:
                     break
+                n_obs = s2c_passed + s2c_failed
+                if s2c_failed >= 3 and s2c_failed / max(n_obs, 1) > 0.45:
+                    break
                 if s2c_failed >= 2 and not s2c_passed and not STEP2C_KEEP_AFTER_FAIL:
                     break
-                cur_roi = STEP2C_FAIL_ROI if (s2c_failed >= 2 and s2c_failed >= s2c_passed) else MIN_ROI_RATIO
+                if s2c_failed == 0 and s2c_passed >= 2:
+                    cur_roi = min(MIN_ROI_RATIO, 1.08)
+                elif s2c_failed >= 2 and s2c_failed >= s2c_passed:
+                    cur_roi = STEP2C_FAIL_ROI
+                else:
+                    cur_roi = MIN_ROI_RATIO
                 s2c_cands = verifiable - passed - failed - blocked_decap
                 if fix_narrow_only:
                     s2c_cands = {n for n in s2c_cands if n in task.case_filter and len(task.case_filter[n]) <= 8}
+                cur_pool = task.chosen - passed
                 batch = _best_drop_prefix(
-                    task.chosen - passed,
+                    cur_pool,
                     s2c_cands,
                     ms_by_number,
                     cpu_by_number,
@@ -1447,7 +1719,9 @@ def _start_child_verification(
                         batch_ok = False
                         break
                 if batch_ok:
-                    break
+                    _, cur_workers = split_with_cost([(ms_by_number[n], n) for n in (task.chosen - passed)])
+                    if len(cur_workers) <= 1 and cur_roi <= min(MIN_ROI_RATIO, 1.08):
+                        break
             # When the commit has 0 failures so far (>=2 passes), unlock dynamic 0-fail tail
             # clearing (full empty drops the 2.0s last-worker startup) and worker collapsing.
             if not failed and len(passed) >= 2 and time.process_time() - step2c_t0 <= 12.0:
@@ -1528,7 +1802,23 @@ def _budget_scale(n_commits: int) -> float:
     return max(1.0, n_commits / 30)
 
 
-_CASE_MAP: dict | None = None
+_CASE_DATA: tuple[dict, list[bytes] | None, dict[int, int]] | None = None
+
+
+def _get_case_map() -> tuple[dict, list[bytes] | None, dict[int, int]]:
+    global _CASE_DATA
+    if _CASE_DATA is None:
+        from blast_radius.precompile_cases import CASES_FILE
+
+        if CASES_FILE.is_file():
+            raw = marshal.loads(CASES_FILE.read_bytes())
+            if isinstance(raw, dict) and raw.get("interned"):
+                _CASE_DATA = (raw["cases"], raw["sets"], {})
+            else:
+                _CASE_DATA = (raw, None, {})
+        else:
+            _CASE_DATA = ({}, None, {})
+    return _CASE_DATA
 
 
 def _decode_mask(mask: int, number_by_index: list[int | None] | None) -> set[int]:
@@ -1551,6 +1841,7 @@ def _case_plan(
     id_by_number: dict[int, str],
     base_cpu: dict[int, int],
     number_by_index: list[int | None] | None = None,
+    opt_c_scale: float = 1.0,
 ) -> tuple[
     dict[int, set[tuple[str, int]]],
     dict[int, tuple[int, int]],
@@ -1561,7 +1852,6 @@ def _case_plan(
     dict[int, int],
 ]:
     """Compute per-case/subTest/block/Validator/TPC query filters and scaled CPU estimates for `chosen`."""
-    global _CASE_MAP
     case_filter: dict[int, set[tuple[str, int]]] = {}
     subtest_filter: dict[int, tuple[int, int]] = {}
     block_filter: dict[int, int] = {}
@@ -1575,15 +1865,22 @@ def _case_plan(
     sg_nums = _decode_mask(sel.sqlglot_mask, number_by_index)
 
     if sel.edited_spans is not None:
-        if _CASE_MAP is None:
-            from blast_radius.precompile_cases import CASES_FILE
+        cases_dict, sets_raw, sets_cache = _get_case_map()
 
-            _CASE_MAP = marshal.loads(CASES_FILE.read_bytes()) if CASES_FILE.is_file() else {}
+        def _decode_idx(idx: int) -> int:
+            if sets_raw is None:
+                return idx
+            val = sets_cache.get(idx)
+            if val is None:
+                val = int.from_bytes(sets_raw[idx], "little")
+                sets_cache[idx] = val
+            return val
+
         for num in chosen:
             if num in non_sg_nums:
                 continue
             tid = id_by_number[num]
-            entry = _CASE_MAP.get(tid)
+            entry = cases_dict.get(tid)
             if entry is None:
                 continue
             kind = entry.get("kind", "check_file")
@@ -1594,7 +1891,9 @@ def _case_plan(
                 per_line = entry["lines"].get(path)
                 if per_line:
                     for line in range(first, last + 1):
-                        mask |= per_line.get(line, 0)
+                        val = per_line.get(line)
+                        if val is not None:
+                            mask |= _decode_idx(val)
             if kind == "check_file" and num in fix_mapped_nums:
                 if num in sg_nums and mask == 0:
                     continue
@@ -1632,7 +1931,9 @@ def _case_plan(
                         per_line = s2b_lines.get(path)
                         if per_line:
                             for line in range(first, last + 1):
-                                s2b_mask |= per_line.get(line, 0)
+                                val = per_line.get(line)
+                                if val is not None:
+                                    s2b_mask |= _decode_idx(val)
                     if s2b_mask:
                         tpc_s2b_query_mask[num] = s2b_mask
                 continue
@@ -1678,12 +1979,9 @@ def _case_plan(
             for p in sel.patched_files
         )
         if all_pairs_mapped:
-            if _CASE_MAP is None:
-                from blast_radius.precompile_cases import CASES_FILE
-
-                _CASE_MAP = marshal.loads(CASES_FILE.read_bytes()) if CASES_FILE.is_file() else {}
+            cases_dict, _, _ = _get_case_map()
             for num in chosen:
-                entry = _CASE_MAP.get(id_by_number[num])
+                entry = cases_dict.get(id_by_number[num])
                 if entry is None or entry.get("kind") != "check_file":
                     continue
                 cases = entry["cases"]
@@ -1706,9 +2004,9 @@ def _case_plan(
         for num in chosen:
             if id_by_number[num] == OPT_TPCDS_TEST_ID:
                 if num in case_filter:
-                    scaled = max(45, ckpt_est_ms * (len(case_filter[num]) + 1) // 100)
+                    scaled = max(35, round(ckpt_est_ms * opt_c_scale * (len(case_filter[num]) + 1) / 100))
                 else:
-                    scaled = ckpt_est_ms
+                    scaled = max(40, round(ckpt_est_ms * opt_c_scale))
                 cpu_override[num] = min(cpu_override.get(num, base_cpu[num]), scaled)
 
     return case_filter, subtest_filter, block_filter, validator_filter, tpc_query_mask, tpc_s2b_query_mask, cpu_override
@@ -1720,20 +2018,63 @@ def plan_verification(
     ms_by_number: dict[int, int],
     base_cpu: dict[int, int],
     number_by_index: list[int | None] | None = None,
+    base_cpu_c: dict[int, int] | None = None,
+    tpc_c_ms: dict[str, int] | None = None,
 ) -> tuple[list[VerifyTask], list[VerifyTask]]:
     """Select and prioritize commits worth runtime verification or makespan decapitation."""
+    manifest = load_c_manifest() if ENABLE_MYPYC else None
+    all_c_groups = frozenset(manifest.get("groups", ())) if manifest else frozenset()
     candidates: list[VerifyTask] = []
     for commit, chosen, sel in commits:
         if not chosen or not sel.patched_files or sel.reason.startswith("everything"):
             continue
-        touches_leaf = any(p in LEAF_COMPILED_FILES for p in sel.patched_files)
-        use_mypyc = (
-            ENABLE_MYPYC
-            and not touches_leaf
-            and "sqlglot/tokens.py" in sel.patched_files
-            and any(id_by_number[n] == MAX_NODES_TEST_ID for n in chosen)
-            and not tokenizer_edit_position_free(sel)
+        if manifest is not None and ENABLE_MYPYC:
+            if "sqlglot/__init__.py" in sel.patched_files or any(
+                (p.startswith("sqlglot/") and not p.endswith(".py")) or sel.patched_files[p] is None
+                for p in sel.patched_files
+            ):
+                disabled_c = all_c_groups
+            else:
+                disabled_c = disabled_groups_for(sel.patched_files)
+            c_enabled = bool(all_c_groups - disabled_c)
+        else:
+            disabled_c = frozenset()
+            c_enabled = False
+        leaf_compiled = manifest is not None and ("leaf" not in disabled_c)
+        c_exec_fast = bool(
+            manifest is not None
+            and ENABLE_MYPYC
+            and not (disabled_c & {"leaf", "expr", "parse", "gen", "exec_table"})
         )
+        c_bucket = phase2_c_bucket(disabled_c) if c_enabled else "fallback_c"
+        tok_untouched = not tokenizer_edit_touches_max_nodes(sel)
+
+        if base_cpu_c is None or not c_enabled or bool(disabled_c & {"leaf", "expr"}):
+            commit_base_cpu = dict(base_cpu)
+        elif disabled_c & {"parse", "gen"}:
+            commit_base_cpu = {n: round(0.45 * base_cpu_c[n] + 0.55 * base_cpu[n]) for n in chosen}
+        elif disabled_c:
+            commit_base_cpu = {
+                n: (
+                    round(0.40 * base_cpu_c[n] + 0.60 * base_cpu[n])
+                    if ms_by_number[n] >= 300 and id_by_number[n].startswith("tests/test_optimizer.py::")
+                    else base_cpu_c[n]
+                )
+                for n in chosen
+            }
+        else:
+            commit_base_cpu = {n: base_cpu_c[n] for n in chosen}
+
+        opt_py_ms = next((base_cpu[n] for n in chosen if id_by_number[n] == OPT_TPCDS_TEST_ID), 0)
+        if c_exec_fast:
+            opt_c_scale = (
+                min(1.0, max(0.22, tpc_c_ms["opt_tpcds_full"] / max(opt_py_ms, 1)))
+                if (tpc_c_ms and tpc_c_ms.get("opt_tpcds_full") and opt_py_ms > 0)
+                else 0.40
+            )
+        else:
+            opt_c_scale = 1.0
+
         touches_test_py = any(p.startswith("tests/") and p.endswith(".py") for p in sel.patched_files)
         (
             case_filter,
@@ -1743,16 +2084,39 @@ def plan_verification(
             tpc_query_mask,
             tpc_s2b_query_mask,
             cpu_override,
-        ) = _case_plan(chosen, sel, id_by_number, base_cpu, number_by_index=number_by_index)
-        cpu_by_number = {**base_cpu, **cpu_override} if cpu_override else dict(base_cpu)
+        ) = _case_plan(
+            chosen,
+            sel,
+            id_by_number,
+            commit_base_cpu,
+            number_by_index=number_by_index,
+            opt_c_scale=opt_c_scale,
+        )
+        cpu_by_number = {n: cpu_override.get(n, commit_base_cpu[n]) for n in chosen}
+        for n in chosen:
+            if cpu_by_number[n] != base_cpu[n]:
+                cpu_override[n] = cpu_by_number[n]
+
         tids = [id_by_number[n] for n in chosen]
         verifiable = {
             n
             for n in chosen
             if id_by_number[n] not in SUBPROCESS_TESTS
-            and not (use_mypyc and id_by_number[n] in PURE_PYTHON_ONLY_TESTS)
+            and not (c_enabled and id_by_number[n] in PURE_PYTHON_ONLY_TESTS)
         }
-        if not verifiable:
+        can_fast_gm, is_scoped_gm = _can_fast_gen_mem(sel)
+        gen_mem_num = next(
+            (
+                n
+                for n in chosen
+                if id_by_number[n] == GEN_MEM_TEST_ID
+                and c_enabled
+                and can_fast_gm
+                and not touches_test_py
+            ),
+            None,
+        )
+        if not verifiable and gen_mem_num is None:
             continue
 
         static_cost_ms, _ = split_with_cost([(ms_by_number[n], n) for n in chosen])
@@ -1763,7 +2127,6 @@ def plan_verification(
             and sel.hot_patch_targets is not None
             and not sel.lazy_pp_mask
             and not touches_test_py
-            and not use_mypyc
             and not any(
                 tid in FRESH_IMPORT_TESTS and not (lazy_safe_p2 and tid == LAZY_LOAD_TEST_ID)
                 for tid in tids
@@ -1793,7 +2156,17 @@ def plan_verification(
             elif tpc_mode == "fast_b" and not ENABLE_TPC_FAST_B:
                 if any(
                     _est_test_cpu_ms(
-                        n, id_by_number[n], sel, tpc_mode, cpu_by_number, tpc_query_mask, tpc_s2b_query_mask
+                        n,
+                        id_by_number[n],
+                        sel,
+                        tpc_mode,
+                        cpu_by_number,
+                        tpc_query_mask,
+                        tpc_s2b_query_mask,
+                        c_exec_fast=c_exec_fast,
+                        tok_untouched=tok_untouched,
+                        leaf_compiled=leaf_compiled,
+                        tpc_c_ms=tpc_c_ms,
                     )
                     > FAST_B_MAX_EST_MS
                     for n in tpc_nums
@@ -1801,7 +2174,18 @@ def plan_verification(
                     tpc_mode = None
 
         for num in verifiable:
-            sp = _special_cpu_ms(num, id_by_number[num], sel, tpc_mode, tpc_query_mask, tpc_s2b_query_mask)
+            sp = _special_cpu_ms(
+                num,
+                id_by_number[num],
+                sel,
+                tpc_mode,
+                tpc_query_mask,
+                tpc_s2b_query_mask,
+                c_exec_fast=c_exec_fast,
+                tok_untouched=tok_untouched,
+                leaf_compiled=leaf_compiled,
+                tpc_c_ms=tpc_c_ms,
+            )
             if sp is not None:
                 scaled_sp = round(sp * SPECIAL_CPU_SCALE)
                 if scaled_sp < cpu_by_number[num]:
@@ -1810,8 +2194,12 @@ def plan_verification(
 
         rem_verifiable = verifiable - lazy_pp_nums
 
-        # Identify high-ROI heavy and medium peak-shaving targets inside rem_verifiable.
+        # Identify high-ROI heavy and medium peak-shaving targets inside rem_verifiable (plus pure-Py gen_mem).
         raw_decap: list[tuple[int, int, int]] = []  # (sim_ms, est_cpu_ms, num)
+        if gen_mem_num is not None and gen_mem_num not in lazy_pp_nums:
+            gm_cpu = (450 if is_scoped_gm else 550) + 150
+            if gm_cpu < ms_by_number[gen_mem_num]:
+                raw_decap.append((ms_by_number[gen_mem_num], gm_cpu, gen_mem_num))
         for num in rem_verifiable:
             if sel.fixture_only and not VERIFY_FIXTURE_MAX_MS and not (num in case_filter and len(case_filter[num]) <= 8):
                 continue
@@ -1820,10 +2208,34 @@ def plan_verification(
             if tid in TPC_SUITE_BY_TEST_ID:
                 if tpc_mode is None:
                     continue
-                c_ms = _est_test_cpu_ms(num, tid, sel, tpc_mode, cpu_by_number, tpc_query_mask, tpc_s2b_query_mask)
+                c_ms = _est_test_cpu_ms(
+                    num,
+                    tid,
+                    sel,
+                    tpc_mode,
+                    cpu_by_number,
+                    tpc_query_mask,
+                    tpc_s2b_query_mask,
+                    c_exec_fast=c_exec_fast,
+                    tok_untouched=tok_untouched,
+                    leaf_compiled=leaf_compiled,
+                    tpc_c_ms=tpc_c_ms,
+                )
                 raw_decap.append((sim_ms, c_ms, num))
             elif tid in (OPT_TPCH_TEST_ID, MAX_NODES_TEST_ID, GEN_MEM_TEST_ID, LAZY_LOAD_TEST_ID):
-                c_ms = _est_test_cpu_ms(num, tid, sel, tpc_mode, cpu_by_number, tpc_query_mask, tpc_s2b_query_mask)
+                c_ms = _est_test_cpu_ms(
+                    num,
+                    tid,
+                    sel,
+                    tpc_mode,
+                    cpu_by_number,
+                    tpc_query_mask,
+                    tpc_s2b_query_mask,
+                    c_exec_fast=c_exec_fast,
+                    tok_untouched=tok_untouched,
+                    leaf_compiled=leaf_compiled,
+                    tpc_c_ms=tpc_c_ms,
+                )
                 if c_ms < sim_ms:
                     raw_decap.append((sim_ms, c_ms, num))
             elif sim_ms >= 150:
@@ -1831,9 +2243,6 @@ def plan_verification(
                 if c_ms <= sim_ms * DECAP_CPU_RATIO:
                     raw_decap.append((sim_ms, c_ms, num))
 
-        # Pick the prefix with the best net makespan / worker-count reduction, trying two
-        # orders: tallest-first (knock down the ceiling) and cheapest-per-saved-ms first (so a
-        # nearly free test is not stuck behind expensive taller ones).
         raw_decap = sorted(raw_decap, key=lambda item: (item[1] - item[0], item[2]))[:30]
         cur_pool = chosen - lazy_pp_nums
         cur_cost, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
@@ -1860,8 +2269,10 @@ def plan_verification(
             if order_best > best_net:
                 best_net, best_prefix = order_best, order_prefix
 
-        decap_targets = list(best_prefix)
+        pure_py_decap = [n for n in best_prefix if n == gen_mem_num]
+        decap_targets = [n for n in best_prefix if n != gen_mem_num]
         decap_set = set(decap_targets)
+        all_decap_set = set(best_prefix)
 
         def plan_tail(pool: set[int], cands: set[int]) -> tuple[list[int], int]:
             if sel.fixture_only and not VERIFY_FIXTURE_MAX_MS:
@@ -1884,22 +2295,36 @@ def plan_verification(
             return prefix, sum(cpu_by_number[n] for n in prefix) + mod_count * per_mod_ms
 
         decap_cpu = sum(
-            _est_test_cpu_ms(n, id_by_number[n], sel, tpc_mode, cpu_by_number, tpc_query_mask, tpc_s2b_query_mask)
+            _est_test_cpu_ms(
+                n,
+                id_by_number[n],
+                sel,
+                tpc_mode,
+                cpu_by_number,
+                tpc_query_mask,
+                tpc_s2b_query_mask,
+                c_exec_fast=c_exec_fast,
+                tok_untouched=tok_untouched,
+                leaf_compiled=leaf_compiled,
+                tpc_c_ms=tpc_c_ms,
+            )
             for n in decap_targets
-        ) + (15 if lazy_pp_nums else 0)
-        pool_after_decap = chosen - lazy_pp_nums - decap_set
+        ) + (15 if lazy_pp_nums else 0) + (len(pure_py_decap) * ((450 if is_scoped_gm else 550) + 150))
+        pool_after_decap = chosen - lazy_pp_nums - all_decap_set
         tail_prefix, tail_cpu = plan_tail(pool_after_decap, rem_verifiable - decap_set)
         cost_after, _ = split_with_cost([(ms_by_number[n], n) for n in pool_after_decap - set(tail_prefix)])
-        est_cpu_ms = overhead_ms + decap_cpu + tail_cpu
+        own_overhead = overhead_ms if (decap_targets or tail_prefix or lazy_pp_nums) else 0
+        est_cpu_ms = own_overhead + decap_cpu + tail_cpu
         saved_ms = static_cost_ms - cost_after
         expected_gain_ms = saved_ms - est_cpu_ms * CPU_WEIGHT
         has_heavy_tpc_or_max = any(
             id_by_number[n] in TPC_SUITE_BY_TEST_ID or id_by_number[n] == MAX_NODES_TEST_ID for n in decap_targets
-        )
+        ) or bool(pure_py_decap)
         min_req = TPC_MIN_GAIN_MS if has_heavy_tpc_or_max else MIN_DECAP_GAIN_MS if decap_targets else MIN_GAIN_MS
         roi_ok = (saved_ms >= est_cpu_ms * MIN_ROI_RATIO * CPU_WEIGHT) or (saved_ms >= 5000 and expected_gain_ms >= 2500)
-        if (expected_gain_ms < min_req or not roi_ok) and decap_targets:
+        if (expected_gain_ms < min_req or not roi_ok) and best_prefix:
             # Without the decapitation targets, the tail alone may still pay off.
+            pure_py_decap = []
             decap_targets = []
             tail_prefix, tail_cpu = plan_tail(chosen - lazy_pp_nums, rem_verifiable)
             cost_after, _ = split_with_cost([(ms_by_number[n], n) for n in chosen - lazy_pp_nums - set(tail_prefix)])
@@ -1908,7 +2333,7 @@ def plan_verification(
             expected_gain_ms = saved_ms - est_cpu_ms * CPU_WEIGHT
             min_req = MIN_GAIN_MS
             roi_ok = saved_ms >= est_cpu_ms * MIN_ROI_RATIO * CPU_WEIGHT
-        if not (decap_targets or tail_prefix or lazy_pp_nums) or expected_gain_ms < min_req or not roi_ok:
+        if not (decap_targets or pure_py_decap or tail_prefix or lazy_pp_nums) or expected_gain_ms < min_req or not roi_ok:
             continue
 
         candidates.append(
@@ -1930,7 +2355,11 @@ def plan_verification(
                 tpc_query_mask=tpc_query_mask,
                 tpc_s2b_query_mask=tpc_s2b_query_mask,
                 cpu_override=cpu_override,
-                use_mypyc=use_mypyc,
+                disabled_c_groups=disabled_c,
+                c_bucket=c_bucket,
+                c_exec_fast=c_exec_fast,
+                pure_py_decap=pure_py_decap,
+                tok_untouched=tok_untouched,
             )
         )
 
@@ -1952,9 +2381,9 @@ def plan_verification(
             phase2.append(task)
     phase1.sort(key=lambda t: t.commit)
     phase2.sort(key=lambda t: t.commit)
-    # Free the 7MB case map before forking children (tasks already hold extracted filters).
-    global _CASE_MAP
-    _CASE_MAP = None
+    # Free the case map before forking children (tasks already hold extracted filters).
+    global _CASE_DATA
+    _CASE_DATA = None
     return phase1, phase2
 
 
@@ -2019,6 +2448,7 @@ def _prewarm_for_phase2(
         if mod_name not in sys.modules:
             try:
                 mod = importlib.import_module(mod_name)
+                wrap_duckdb_if_loaded()
                 if mod_name in ("tests.test_optimizer", "tests.test_executor"):
                     _patch_pool_references()
                 if mod_name == "tests.test_optimizer":
@@ -2194,6 +2624,63 @@ def _run_batch_parallel(
                 active[r_fd][3].append(chunk)
 
 
+def _run_pure_py_decap(
+    tasks: list[VerifyTask],
+    stop_at: float,
+) -> dict[str, set[int]]:
+    """Run pure-Python generator_memory verifications before any C extensions load."""
+    passed: dict[str, set[int]] = {}
+    for task in tasks:
+        if not task.pure_py_decap or time.monotonic() >= stop_at:
+            continue
+        r_fd, w_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r_fd)
+            try:
+                os.setpgid(0, 0)
+            except OSError:
+                pass
+            ok = False
+            try:
+                os.chdir(SOURCE)
+                if str(SOURCE) not in sys.path:
+                    sys.path.insert(0, str(SOURCE))
+                sys.meta_path.insert(0, _OverlayFinder(task.selection.patched_files, root=SOURCE))
+                _install_open_overlay(task.selection.patched_files)
+                signal.signal(signal.SIGALRM, _raise_timeout)
+                signal.alarm(20)
+                _, is_scoped = _can_fast_gen_mem(task.selection)
+                ok = verify_generator_memory(task.selection.patched_files, scoped_only=is_scoped)
+            except BaseException:
+                ok = False
+            finally:
+                signal.alarm(0)
+                try:
+                    os.write(w_fd, b"1" if ok else b"0")
+                except OSError:
+                    pass
+                os.close(w_fd)
+                os._exit(0)
+        os.close(w_fd)
+        chunks = []
+        rem = max(0.1, stop_at - time.monotonic())
+        ready, _, _ = select.select([r_fd], [], [], min(rem, 25.0))
+        if ready:
+            try:
+                while chunk := os.read(r_fd, 64):
+                    chunks.append(chunk)
+            except OSError:
+                pass
+        _kill_group(pid)
+        os.close(r_fd)
+        os.waitpid(pid, 0)
+        if b"".join(chunks).startswith(b"1"):
+            passed[task.commit] = set(task.pure_py_decap)
+            log(f"{task.commit}: pure_py_decap verified {len(task.pure_py_decap)} test(s)")
+    return passed
+
+
 def verify_batches(
     phase1: list[VerifyTask],
     phase2: list[VerifyTask],
@@ -2203,7 +2690,7 @@ def verify_batches(
     cpu_by_number: dict[int, int] | None = None,
     n_commits: int = 30,
 ) -> dict[str, set[int]]:
-    """Run Phase-1 (clean fork) then Phase-2 (pre-warmed hot-patch fork) verification."""
+    """Run pure-Py decap, Phase-1 (clean fork + modular C), then bucketed Phase-2 coordinators."""
     verified: dict[str, set[int]] = {}
     if not hasattr(os, "fork"):
         return verified
@@ -2214,51 +2701,119 @@ def verify_batches(
     if not all_tasks:
         return verified
 
-    # Only pre-import duckdb in parent if a scheduled task may run a test that imports
-    # test_optimizer (not fast verify_opt_tpcds) or real-unittest test_executor.
-    needs_duckdb = any(
-        (
-            id_by_number[n].startswith("tests/test_optimizer.py::")
-            and not (
-                id_by_number[n] == OPT_TPCDS_TEST_ID
-                and select_tpcds_span(
-                    t.selection.patched_files, max_start=14, for_exec=False, edited_spans=t.selection.edited_spans
-                )
-                is not None
-            )
-        )
-        or (
-            id_by_number[n].startswith("tests/test_executor.py::")
-            and not (t.tpc_mode and id_by_number[n] in TPC_SUITE_BY_TEST_ID)
-            and not (id_by_number[n] == OPT_TPCH_TEST_ID and _can_fast_opt_tpch(t.selection))
-        )
-        for t in all_tasks
-        for n in t.chosen
-    )
-    needs_real_tpc = any(
-        _real_tpc_possible(t.tpc_mode, t.selection, n, id_by_number, ms_by_number, cpu_by_number)
-        for t in all_tasks
-        for n in t.chosen
-    )
-    if needs_duckdb:
-        for pkg in ("duckdb", "numpy", "pandas") if needs_real_tpc else ("duckdb",):
-            try:
-                importlib.import_module(pkg)
-            except Exception:
-                pass
-
     # Capped well inside the final's 270 s limit.
     started = time.monotonic()
     stop_at = started + min(VERIFY_WALL_BUDGET_S * _budget_scale(n_commits), 200.0)
 
-    if phase1:
+    # Run pure-Python decap (e.g. test_generator_memory) before any C extensions load.
+    orig_chosen = {t.commit: set(t.chosen) for t in all_tasks}
+    pre_passed = _run_pure_py_decap(all_tasks, stop_at)
+    for task in all_tasks:
+        pp = pre_passed.get(task.commit)
+        if pp:
+            task.chosen = task.chosen - pp
+
+    phase1_todo = [t for t in phase1 if t.chosen]
+    phase2_todo = [t for t in phase2 if t.chosen]
+
+    if phase1_todo and time.monotonic() < stop_at:
         # Freeze parent heap so forked children don't trigger a full Gen-2 GC / COW storm (~0.6s/child).
         gc.freeze()
-        _run_batch_parallel(phase1, id_by_number, ms_by_number, cpu_by_number, out_fd, stop_at, verified, started)
+        _run_batch_parallel(phase1_todo, id_by_number, ms_by_number, cpu_by_number, out_fd, stop_at, verified, started)
 
-    if phase2 and time.monotonic() < stop_at:
-        _prewarm_for_phase2(phase2, id_by_number, ms_by_number, cpu_by_number)
-        gc.freeze()
-        _run_batch_parallel(phase2, id_by_number, ms_by_number, cpu_by_number, out_fd, stop_at, verified, started)
+    if phase2_todo and time.monotonic() < stop_at:
+        by_bucket: dict[str, list[VerifyTask]] = {}
+        for t in phase2_todo:
+            by_bucket.setdefault(t.c_bucket, []).append(t)
+        manifest = load_c_manifest() if ENABLE_MYPYC else None
+        for bname in ("pure_full_c", "opt_py_c", "parse_py", "gen_py", "fallback_c"):
+            btasks = by_bucket.get(bname)
+            if not btasks or time.monotonic() >= stop_at:
+                continue
+            r_fd, w_fd = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(r_fd)
+                try:
+                    os.setpgid(0, 0)
+                except OSError:
+                    pass
+                if out_fd is not None:
+                    try:
+                        os.close(out_fd)
+                    except OSError:
+                        pass
+                b_verified: dict[str, set[int]] = {}
+                try:
+                    os.chdir(SOURCE)
+                    if str(SOURCE) not in sys.path:
+                        sys.path.insert(0, str(SOURCE))
+                    union_disabled = frozenset().union(*(t.disabled_c_groups for t in btasks))
+                    if manifest is not None and ENABLE_MYPYC and (set(manifest["groups"]) - union_disabled):
+                        install_modular_c(union_disabled, after_overlay=False)
+                    install_db_cache()
+                    needs_real_tpc = any(
+                        _real_tpc_possible(
+                            t.tpc_mode,
+                            t.selection,
+                            n,
+                            id_by_number,
+                            ms_by_number,
+                            {**cpu_by_number, **t.cpu_override} if t.cpu_override else cpu_by_number,
+                        )
+                        for t in btasks
+                        for n in t.chosen
+                    )
+                    if needs_real_tpc:
+                        for pkg in ("numpy", "pandas"):
+                            try:
+                                importlib.import_module(pkg)
+                            except Exception:
+                                pass
+                    _prewarm_for_phase2(btasks, id_by_number, ms_by_number, cpu_by_number)
+                    gc.freeze()
+                    _run_batch_parallel(
+                        btasks,
+                        id_by_number,
+                        ms_by_number,
+                        cpu_by_number,
+                        None,
+                        stop_at,
+                        b_verified,
+                        started,
+                    )
+                except BaseException as err:
+                    log(f"phase2 bucket {bname} error: {err!r}")
+                finally:
+                    try:
+                        os.write(w_fd, marshal.dumps({c: sorted(s) for c, s in b_verified.items()}))
+                    except OSError:
+                        pass
+                    os.close(w_fd)
+                    os._exit(0)
+            os.close(w_fd)
+            chunks = []
+            while True:
+                rem = (stop_at + 5.0) - time.monotonic()
+                if rem <= 0 or not select.select([r_fd], [], [], min(rem, 1.0))[0]:
+                    if rem <= 0:
+                        break
+                    continue
+                chunk = os.read(r_fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            _kill_group(pid)
+            os.close(r_fd)
+            os.waitpid(pid, 0)
+            try:
+                got = marshal.loads(b"".join(chunks))
+                if isinstance(got, dict):
+                    for c, nums in got.items():
+                        verified[c] = set(nums)
+            except Exception:
+                pass
 
+    for c, pp in pre_passed.items():
+        verified[c] = verified.get(c, orig_chosen[c]) - pp
     return verified

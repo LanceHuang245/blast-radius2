@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import marshal
 import os
 import tomllib
@@ -43,6 +44,8 @@ class Selection:
     hot_patch_targets: list[tuple[str, str]] | None
     # Phase 2 safe non-import-time literal class-attribute updates: (rel_path, cls_qual, attr, val).
     attr_hot_targets: list[tuple[str, str, str, object]] | None = None
+    # Phase 2 safe literal default-arg updates: (rel_path, func_qual, defaults, kwdefaults).
+    default_hot_targets: list[tuple[str, str, tuple | None, dict | None]] | None = None
     fixture_only: bool = False
     # Bitmask of tests in `mask` pulled in solely by pushdown_predicates.py:36-37 lazy imports.
     lazy_pp_mask: int = 0
@@ -298,9 +301,7 @@ def _extract_dict_hot_targets(
     hunks,
     impact: ImpactMap,
 ) -> list[tuple[str, str, str, list[str], list[tuple[str, str]]]] | None:
-    """Return Phase-2 entry updates if every edit modifies explicit keys of tracked leaf-class dicts."""
-    if not impact.leaf_classes:
-        return None
+    """Return Phase-2 entry updates if every edit modifies explicit keys of tracked class dicts."""
     seen_attrs: list[tuple[str, str, ast.stmt, ast.stmt]] = []
     seen_keys: set[tuple[str, str]] = set()
     for removed, added in change_blocks(hunks):
@@ -345,7 +346,6 @@ def _extract_dict_hot_targets(
         key_id = f"{cls_key}|{attr}"
         if (
             key_id not in impact.tracked_dicts
-            or cls_key not in impact.leaf_classes
             or cls_key in impact.pre_hook_classes
             or key_id in impact.collect_attrs
         ):
@@ -469,6 +469,46 @@ def _fixture_pair_key(pair: tuple[dict[str, str], str, str]) -> tuple:
     return (tuple(sorted(pair[0].items())), pair[1], pair[2])
 
 
+def _literal_defaults_diff(
+    old_args: ast.arguments,
+    new_args: ast.arguments,
+    ignore_ann: bool,
+) -> tuple[tuple | None, dict | None] | None:
+    """If args differ ONLY in literal default values at identical default slots, return new (__defaults__, __kwdefaults__)."""
+    if len(old_args.defaults) != len(new_args.defaults) or len(old_args.kw_defaults) != len(new_args.kw_defaults):
+        return None
+    if [d is None for d in old_args.kw_defaults] != [d is None for d in new_args.kw_defaults]:
+        return None
+    o_stripped = copy.copy(old_args)
+    o_stripped.defaults = []
+    o_stripped.kw_defaults = []
+    n_stripped = copy.copy(new_args)
+    n_stripped.defaults = []
+    n_stripped.kw_defaults = []
+    if canon_ast(o_stripped, ignore_ann) != canon_ast(n_stripped, ignore_ann):
+        return None
+    for d in (*old_args.defaults, *new_args.defaults, *old_args.kw_defaults, *new_args.kw_defaults):
+        if d is None:
+            continue
+        if not _is_safe_default_expr(d):
+            return None
+        try:
+            ast.literal_eval(d)
+        except Exception:
+            return None
+    try:
+        new_defs = tuple(ast.literal_eval(d) for d in new_args.defaults) if new_args.defaults else None
+        kw_map = {
+            kw.arg: ast.literal_eval(d)
+            for kw, d in zip(new_args.kwonlyargs, new_args.kw_defaults)
+            if d is not None
+        }
+        new_kwdefs = kw_map if kw_map else None
+    except Exception:
+        return None
+    return new_defs, new_kwdefs
+
+
 def _extract_hot_patch_targets(
     path: str,
     old_scopes: Scopes,
@@ -476,54 +516,77 @@ def _extract_hot_patch_targets(
     hunks,
     runs_at_import,
     ignore_ann: bool = False,
-) -> tuple[list[tuple[str, str]], dict[tuple[str, str], tuple[int, int, bool]]] | None:
-    """Return ([(path, qualname)], spans) if every edit is strictly inside existing non-nested function bodies."""
+) -> tuple[
+    list[tuple[str, str]],
+    dict[tuple[str, str], tuple[int, int, bool]],
+    list[tuple[str, str, tuple | None, dict | None]],
+] | None:
+    """Return ([(path, qualname)], spans, default_updates) if every edit is hot-patchable inside existing functions."""
     targets: set[tuple[str, str]] = set()
     spans: dict[tuple[str, str], tuple[int, int, bool]] = {}
+    defaults_map: dict[tuple[str, str], tuple[tuple | None, dict | None]] = {}
     fut_ann = new_scopes.has_future_annotations
+
+    def _check_pair(
+        qual: str,
+        old_fn: tuple,
+        new_fn: tuple,
+        in_header: bool,
+    ) -> bool:
+        old_node = old_fn[4]
+        new_node = new_fn[4]
+        if type(old_node) is not type(new_node) or old_node.name != new_node.name:
+            return False
+        if not all(_decorator_name(d) in SAFE_HOTPATCH_DECORATORS for d in old_node.decorator_list):
+            return False
+        if [ast.dump(d) for d in old_node.decorator_list] != [ast.dump(d) for d in new_node.decorator_list]:
+            return False
+        if canon_ast(old_node.returns, ignore_ann) != canon_ast(new_node.returns, ignore_ann):
+            return False
+        if canon_ast(old_node.args, ignore_ann) != canon_ast(new_node.args, ignore_ann):
+            lit_diff = _literal_defaults_diff(old_node.args, new_node.args, ignore_ann)
+            if lit_diff is None:
+                return False
+            defaults_map[(path, qual)] = lit_diff
+        elif in_header and old_node.returns is not None and not ignore_ann:
+            pass
+        targets.add((path, qual))
+        spans[(path, qual)] = (new_fn[2], new_fn[1], fut_ann)
+        return True
+
     for removed, added in change_blocks(hunks):
         for old_no, _ in removed:
             fn = old_scopes.function_at(old_no)
-            if fn is None or old_no < fn[0]:
+            if fn is None:
                 return None
-            body_start, end, _head, qual, old_node = fn
-            if "<locals>" in qual or runs_at_import(path, body_start, end):
+            body_start, end, head, qual, old_node = fn
+            in_header = old_no < body_start
+            if "<locals>" in qual or runs_at_import(path, head if in_header else body_start, end):
                 return None
             old_rt, new_fn = _runtime_def(old_scopes, qual), _runtime_def(new_scopes, qual)
             if old_rt is None or old_rt[4] is not old_node or new_fn is None:
                 return None
-            new_node = new_fn[4]
-            if not all(_decorator_name(d) in SAFE_HOTPATCH_DECORATORS for d in old_node.decorator_list):
+            if not _check_pair(qual, fn, new_fn, in_header):
                 return None
-            if [ast.dump(d) for d in old_node.decorator_list] != [ast.dump(d) for d in new_node.decorator_list]:
-                return None
-            if canon_ast(old_node.args, ignore_ann) != canon_ast(new_node.args, ignore_ann):
-                return None
-            targets.add((path, qual))
-            spans[(path, qual)] = (new_fn[2], new_fn[1], fut_ann)
 
         for new_no, _anchor, _ in added:
             fn = new_scopes.function_at(new_no)
-            if fn is None or new_no < fn[0]:
+            if fn is None:
                 return None
-            _body_start, _end, _head, qual, new_node = fn
+            body_start, end, head, qual, new_node = fn
+            in_header = new_no < body_start
             if "<locals>" in qual:
                 return None
             old_fn, new_rt = _runtime_def(old_scopes, qual), _runtime_def(new_scopes, qual)
-            if new_rt is None or new_rt[4] is not new_node:
+            if new_rt is None or new_rt[4] is not new_node or old_fn is None:
                 return None
-            if old_fn is None or runs_at_import(path, old_fn[0], old_fn[1]):
+            if runs_at_import(path, old_fn[2] if in_header else old_fn[0], old_fn[1]):
                 return None
-            old_node = old_fn[4]
-            if not all(_decorator_name(d) in SAFE_HOTPATCH_DECORATORS for d in old_node.decorator_list):
+            if not _check_pair(qual, old_fn, new_rt, in_header):
                 return None
-            if [ast.dump(d) for d in old_node.decorator_list] != [ast.dump(d) for d in new_node.decorator_list]:
-                return None
-            if canon_ast(old_node.args, ignore_ann) != canon_ast(new_node.args, ignore_ann):
-                return None
-            targets.add((path, qual))
-            spans[(path, qual)] = (new_rt[2], new_rt[1], fut_ann)
-    return sorted(targets), spans
+
+    default_updates = [(p, q, defs, kwdefs) for (p, q), (defs, kwdefs) in sorted(defaults_map.items())]
+    return sorted(targets), spans, default_updates
 
 
 class Selector:
@@ -541,12 +604,7 @@ class Selector:
         self._owner_checks: set[str] = set()
         self._fixture_changed_pairs: dict[str, set[int]] = {}
         self._state = marshal.loads(STATE_FILE.read_bytes()) if STATE_FILE.is_file() else None
-        self.values = None
-        values_file = APP / "map" / "values.bin"
-        if values_file.is_file() and os.environ.get("BR_VALUES", "1") != "0":
-            from blast_radius.values import ValueMap
-
-            self.values = ValueMap(values_file, impact.test_ids)
+        self._values = ...
         self._registry_bits = sum(
             1 << i for i, t in enumerate(impact.test_ids) if t == "tests/dialects/test_dialect.py::TestDialect::test_enum"
         )
@@ -592,6 +650,22 @@ class Selector:
             self._old[path] = (text, Scopes(ast.parse(text), has_lambda="lambda" in text, text=text))
         return self._old[path]
 
+    @property
+    def values(self):
+        if self._values is ...:
+            values_file = APP / "map" / "values.bin"
+            if values_file.is_file() and os.environ.get("BR_VALUES", "1") != "0":
+                from blast_radius.values import ValueMap
+
+                self._values = ValueMap(values_file, self.impact.test_ids)
+            else:
+                self._values = None
+        return self._values
+
+    @values.setter
+    def values(self, value) -> None:
+        self._values = value
+
     def select(self, patch_text: str) -> tuple[int, str]:
         sel = self.select_detailed(patch_text)
         return sel.mask, sel.reason
@@ -612,6 +686,7 @@ class Selector:
             patched_files: dict[str, str] = {}
             hot_targets: list[tuple[str, str]] | None = []
             hot_spans: dict[tuple[str, str], tuple[int, int, bool]] = {}
+            default_targets: list[tuple[str, str, tuple | None, dict | None]] = []
             attr_targets: list[tuple[str, str, str, object]] | None = []
             dict_targets: list[tuple[str, str, str, list[str], list[tuple[str, str]]]] | None = []
             self._hit_pp_lazy = False
@@ -620,8 +695,10 @@ class Selector:
             self._spans, self._spans_ok = [], True
             self._fixture_changed_pairs = {}
             self._hot_spans_cur: dict[tuple[str, str], tuple[int, int, bool]] = {}
+            self._default_targets_cur: list[tuple[str, str, tuple | None, dict | None]] = []
             for file_patch in files:
                 self._hot_spans_cur = {}
+                self._default_targets_cur = []
                 file_mask, is_noop, is_fixture_or_comment, f_targets, a_targets, d_targets = self.select_file_detailed(
                     file_patch, patched_files
                 )
@@ -647,6 +724,7 @@ class Selector:
                     if hot_targets is not None and f_targets:
                         hot_targets.extend(f_targets)
                         hot_spans.update(self._hot_spans_cur)
+                        default_targets.extend(self._default_targets_cur)
                     if attr_targets is not None and a_targets:
                         attr_targets.extend(a_targets)
                     if dict_targets is not None and d_targets:
@@ -695,6 +773,7 @@ class Selector:
                 patched_files={} if self._no_verify else patched_files,
                 hot_patch_targets=hot_targets,
                 attr_hot_targets=attr_targets,
+                default_hot_targets=(default_targets or None) if hot_targets is not None else None,
                 fixture_only=all_fixture_or_noop and not all_noop,
                 lazy_pp_mask=lazy_pp_mask,
                 import_checks=owners,
@@ -986,8 +1065,9 @@ class Selector:
             ran_before = self.runs_before_tests if self._coarse_block else (lambda *_: False)
             hp_res = _extract_hot_patch_targets(path, old_scopes, new_scopes, hunks, ran_before, ignore_ann)
             if hp_res is not None:
-                targets, hspans = hp_res
+                targets, hspans, dtargets = hp_res
                 self._hot_spans_cur.update(hspans)
+                self._default_targets_cur.extend(dtargets)
             else:
                 attr_targets = _extract_attr_hot_targets(path, module, old_scopes, new_scopes, hunks, self.impact)
                 if attr_targets is None:

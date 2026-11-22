@@ -20,16 +20,19 @@ from __future__ import annotations
 import math
 import os
 import pickle
+import signal
 import sys
 import time
 
 from blast_radius.astlayout import restore as ast_restore
+from blast_radius.db_cache import TPCDS_DUCKDB_FILE, TPCH_DUCKDB_FILE
 from blast_radius.precompile_cases import (
     TPC_S1_BLOBS_FILE,
     TPC_S2_BLOBS_DIR,
     TPCDS_CKPTS_META_FILE,
     tpc_s2_query_file,
     tpc_s2_table_file,
+    tpcds_ckpt_bin_files,
     tpcds_ckpt_stage_file,
 )
 from blast_radius.precompile_tpc import (
@@ -108,9 +111,9 @@ TPC_EST_CPU_MS = {
 # up in the first (cheapest) re-executed queries.
 TPC_REEXEC_MAX_QUERIES = int(os.environ.get("BR_TPC_REEXEC_MAX", "99"))
 TPC_REEXEC_EST_BUDGET_MS = int(os.environ.get("BR_TPC_REEXEC_EST_MS", "20000"))
-TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "45.0"))
+TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "12.0"))
 TPC_DUCK_MAX_QUERIES = int(os.environ.get("BR_TPC_DUCK_MAX", "99"))
-TPC_DUCK_BUDGET_S = float(os.environ.get("BR_TPC_DUCK_BUDGET", "15.0"))
+TPC_DUCK_BUDGET_S = float(os.environ.get("BR_TPC_DUCK_BUDGET", "8.0"))
 
 _meta_cache: dict | None = None
 _ckpts_meta_cache: dict | None = None
@@ -124,8 +127,41 @@ def load_tpcds_ckpts_meta() -> dict | None:
     return _ckpts_meta_cache
 
 
-def load_tpcds_ckpt_stage(stage: int) -> dict | None:
-    path = tpcds_ckpt_stage_file(stage)
+def load_tpcds_ckpt_stage(
+    stage: int,
+    indices: set[int] | list[int] | tuple[int, ...] | range | None = None,
+    for_exec: bool = False,
+) -> dict | None:
+    """Load TPC-DS checkpoint stage (only seeking/unpickling `indices` when using .meta/.bin)."""
+    meta_path, bin_path = tpcds_ckpt_bin_files(stage, for_exec=for_exec)
+    if meta_path.is_file() and bin_path.is_file():
+        with open(meta_path, "rb") as mh:
+            meta = pickle.load(mh)
+        offsets = meta["offsets"]
+        n = len(offsets)
+        dumps_b: list = [None] * n
+        layouts_b: list = [None] * n
+        targets = range(n) if indices is None else sorted(i for i in indices if 0 <= i < n)
+        with open(bin_path, "rb") as bh:
+            for i in targets:
+                entry = offsets[i]
+                if entry is None:
+                    continue
+                off, ln = entry
+                bh.seek(off)
+                db, lb = pickle.loads(bh.read(ln))
+                dumps_b[i] = db
+                layouts_b[i] = lb
+        out = {
+            "dumps_b": dumps_b,
+            "layouts_b": layouts_b,
+            "expected": meta["expected"],
+            "schema": meta["schema"],
+        }
+        if "sqls" in meta:
+            out["sqls"] = meta["sqls"]
+        return out
+    path = tpcds_ckpt_stage_file(stage, for_exec=for_exec)
     if not path.is_file():
         return None
     with open(path, "rb") as handle:
@@ -170,6 +206,9 @@ def _touched_stage_bits(
     return bits
 
 
+_EXEC_OPT_MASK = (1 << 0) | (((1 << 7) - 1) << 1) | (((1 << 7) - 1) << 22) | (1 << 21)
+
+
 def select_tpcds_span(
     patched_files: dict[str, str],
     max_start: int = 14,
@@ -189,47 +228,70 @@ def select_tpcds_span(
     meta = load_tpcds_ckpts_meta()
     if meta is None:
         return None
-    ckpts = meta["checkpoints"]
+    base_ckpts = meta["checkpoints"]
+    if for_exec:
+        exec_ckpts = meta.get("exec_checkpoints") or {}
+        avail_ckpts = {k: v for k, v in base_ckpts.items() if k <= 7}
+        avail_ckpts.update(exec_ckpts)
+        has_exec_bits = bool(exec_ckpts)
+    else:
+        avail_ckpts = base_ckpts
+        has_exec_bits = False
+
     bits = _touched_stage_bits(meta, patched_files, edited_spans)
 
     start_k: int | None = None
     stop_k: int | None = None
     if bits is not None:
-        # Bit 21 = ensure_schema; bit 0 = parse_one; bits 1..14 = RULES[0..13];
-        # bit 15 = exec RULES[7:]; bit 16 = Plan; bit 17 = e.sql(pretty=True).
+        # Bit 21 = ensure_schema; bit 0 = parse_one; bits 1..14 = non-exec RULES[0..13];
+        # bits 22..28 = exec RULES[7..13]; bit 16 = Plan; bit 17 = e.sql(pretty=True).
         schema_bit = 1 << 21
-        for k in sorted(ckpts, reverse=True):
+        for k in sorted(avail_ckpts, reverse=True):
             if k > max_start:
                 continue
-            prefix_mask = ((1 << (k + 1)) - 1) | schema_bit
+            if for_exec:
+                if not has_exec_bits and k > 7:
+                    continue
+                prefix_mask = schema_bit | (1 << 0)
+                for r in range(k):
+                    prefix_mask |= (1 << (r + 1)) if r < 7 else (1 << (22 + r - 7))
+            else:
+                prefix_mask = ((1 << (k + 1)) - 1) | schema_bit
             if (bits & prefix_mask) == 0:
                 start_k = k
                 break
-        max_stop = min(max_start, 7) if for_exec else max_start
-        tail_guard = ((1 << 15) | (1 << 16) | schema_bit) if for_exec else ((1 << 17) | schema_bit)
+        max_stop = max_start if (not for_exec or has_exec_bits) else min(max_start, 7)
+        tail_guard = ((1 << 16) | schema_bit) if for_exec else ((1 << 17) | schema_bit)
         min_stop = (start_k + 1) if start_k is not None else 0
-        for m in sorted(ckpts):
+        for m in sorted(avail_ckpts):
             if m < min_stop or m > max_stop:
                 continue
             suffix_mask = tail_guard
+            if for_exec and not has_exec_bits:
+                suffix_mask |= 1 << 15
             for r in range(m, 14):
-                suffix_mask |= 1 << (r + 1)
+                if for_exec and has_exec_bits:
+                    suffix_mask |= (1 << (r + 1)) if r < 7 else (1 << (22 + r - 7))
+                else:
+                    suffix_mask |= 1 << (r + 1)
             if (bits & suffix_mask) == 0:
                 stop_k = m
                 break
     else:
         patched_set = set(patched_files)
-        for k in sorted(ckpts, reverse=True):
+        for k in sorted(avail_ckpts, reverse=True):
             if k > max_start:
                 continue
-            if patched_set.isdisjoint(ckpts[k]["files"]):
+            if for_exec and not has_exec_bits and k > 7:
+                continue
+            if patched_set.isdisjoint(avail_ckpts[k]["files"]):
                 start_k = k
                 break
 
         if for_exec:
             can_stop = patched_set.isdisjoint(meta.get("s1_plan_files", ()))
             suffix_key = "suffix_exec_files"
-            max_stop = min(max_start, 7)
+            max_stop = max_start if has_exec_bits else min(max_start, 7)
         else:
             can_stop = patched_set.isdisjoint(meta.get("gen_files", ()))
             suffix_key = "suffix_files"
@@ -237,10 +299,10 @@ def select_tpcds_span(
 
         if can_stop:
             min_stop = (start_k + 1) if start_k is not None else 0
-            for m in sorted(ckpts):
+            for m in sorted(avail_ckpts):
                 if m < min_stop or m > max_stop:
                     continue
-                sfiles = ckpts[m].get(suffix_key)
+                sfiles = avail_ckpts[m].get(suffix_key)
                 if sfiles is not None and patched_set.isdisjoint(sfiles):
                     stop_k = m
                     break
@@ -249,14 +311,20 @@ def select_tpcds_span(
         return None
 
     rule_times = meta.get("rule_times_ms")
+    exec_rule_times = meta.get("exec_rule_times_ms") if for_exec else None
     sql_ms = meta.get("sql_ms", 120.0) if not for_exec else 0.0
     if rule_times:
         lo = start_k if start_k is not None else 0
         hi = stop_k if stop_k is not None else len(rule_times)
+        if for_exec and exec_rule_times and len(exec_rule_times) == 7:
+            merged = list(rule_times[:7]) + list(exec_rule_times)
+            span_ms = sum(merged[lo:hi])
+        else:
+            span_ms = sum(rule_times[lo:hi])
         parse_est = 120.0 if start_k is None else 0.0
-        est_ms = max(90, round(parse_est + sum(rule_times[lo:hi]) * 0.85 + sql_ms + 50.0))
+        est_ms = max(60, round(parse_est + span_ms * 0.85 + sql_ms + 40.0))
     else:
-        est_ms = ckpts[start_k]["est_ms"] if start_k is not None else 500
+        est_ms = avail_ckpts[start_k]["est_ms"] if start_k is not None else 500
     return start_k, stop_k, est_ms
 
 
@@ -266,31 +334,44 @@ def est_tpc_fast_a_ms(
     matched_queries: int | None,
     total_queries: int,
     edited_spans: tuple[tuple[str, int, int], ...] | None = None,
+    c_exec_fast: bool = False,
 ) -> int:
     """Estimate fast_a CPU (ms) accounting for untouched sub-stages, checkpoints, and per-query filtering."""
     base = TPC_EST_CPU_MS[(suite_name, "fast_a")]
     if suite_name == "tpcds" and _all_tpc_safe(patched_files, for_exec=True):
         meta = load_tpcds_ckpts_meta()
         if meta is not None:
+            has_exec = bool(meta.get("exec_checkpoints"))
             bits = _touched_stage_bits(meta, patched_files, edited_spans)
             if bits is not None:
-                opt_mask = ((1 << 16) - 1) | (1 << 21)
+                opt_mask = _EXEC_OPT_MASK if has_exec else (((1 << 16) - 1) | (1 << 21))
                 if (bits & opt_mask) == 0:
-                    base = 350 if (bits & (1 << 16)) == 0 else base
+                    base = 180 if (bits & (1 << 16)) == 0 else (350 if has_exec else base)
                 else:
-                    span = select_tpcds_span(patched_files, max_start=7, for_exec=True, edited_spans=edited_spans)
+                    span = select_tpcds_span(
+                        patched_files,
+                        max_start=14 if has_exec else 7,
+                        for_exec=True,
+                        edited_spans=edited_spans,
+                    )
                     if span is not None:
                         base = min(base, span[2])
             else:
                 patched_set = set(patched_files)
                 if patched_set.isdisjoint(meta["s1_opt_files"]):
-                    base = 350 if patched_set.isdisjoint(meta["s1_plan_files"]) else base
+                    base = 180 if patched_set.isdisjoint(meta["s1_plan_files"]) else (350 if has_exec else base)
                 else:
-                    span = select_tpcds_span(patched_files, max_start=7, for_exec=True)
+                    span = select_tpcds_span(
+                        patched_files,
+                        max_start=14 if has_exec else 7,
+                        for_exec=True,
+                    )
                     if span is not None:
                         base = min(base, span[2])
+    if c_exec_fast:
+        base = max(80, round(base * 0.42))
     if matched_queries is not None and total_queries > 0:
-        base = max(120, base * (matched_queries + 1) // (total_queries + 1))
+        base = max(70, base * (matched_queries + 1) // (total_queries + 1))
     return base
 
 
@@ -304,35 +385,41 @@ def est_tpc_mode_ms(
     edited_spans: tuple[tuple[str, int, int], ...] | None = None,
     s2b_mask: int | None = None,
     s1_mask: int | None = None,
+    c_exec_fast: bool = False,
 ) -> int:
     """Estimate TPC CPU (ms) accounting for untouched sub-stages, checkpoints, and exact per-query timings."""
     if suite_name == "tpch":
         return TPC_EST_CPU_MS[("tpch", mode)]
     if mode == "fast_a":
-        return est_tpc_fast_a_ms(suite_name, patched_files, s1_matched, total_queries, edited_spans)
+        return est_tpc_fast_a_ms(
+            suite_name, patched_files, s1_matched, total_queries, edited_spans, c_exec_fast=c_exec_fast
+        )
     base = TPC_EST_CPU_MS[(suite_name, mode)]
     meta = load_tpcds_ckpts_meta()
     q_ms = (meta.get("s2b_query_ms") or {}).get(suite_name) if meta else None
+    c_factor = 0.38 if c_exec_fast else 1.0
     if q_ms and len(q_ms) == total_queries:
         if mode == "fast_b":
             if s2b_mask is not None:
                 total = sum(q_ms[i] for i in range(total_queries) if s2b_mask >> i & 1)
-                return max(150, total + 180)
-            return max(500, sum(q_ms) + 400)
+                return max(90, round(total * c_factor) + 120)
+            return max(300, round(sum(q_ms) * c_factor) + 220)
         if mode == "full_cached":
-            s1_est = est_tpc_fast_a_ms(suite_name, patched_files, s1_matched, total_queries, edited_spans)
+            s1_est = est_tpc_fast_a_ms(
+                suite_name, patched_files, s1_matched, total_queries, edited_spans, c_exec_fast=c_exec_fast
+            )
             if s1_mask is not None and s2b_mask is not None:
                 fm = s1_mask | s2b_mask
                 s2_est = sum(q_ms[i] for i in range(total_queries) if fm >> i & 1)
-                return max(250, s1_est + s2_est + 200)
-            return max(800, s1_est + sum(q_ms) + 400)
+                return max(150, s1_est + round(s2_est * c_factor) + 140)
+            return max(400, s1_est + round(sum(q_ms) * c_factor) + 250)
     if mode == "fast_b" and s2b_matched is not None and total_queries > 0:
-        return max(150, base * (s2b_matched + 1) // (total_queries + 1))
+        return max(100, round(base * c_factor) * (s2b_matched + 1) // (total_queries + 1))
     if mode == "full_cached" and total_queries > 0:
         if s1_matched is not None and s2b_matched is not None:
             hits = max(s1_matched, s2b_matched)
-            return max(250, base * (hits + 1) // (total_queries + 1))
-    return base
+            return max(150, round(base * c_factor) * (hits + 1) // (total_queries + 1))
+    return max(150, round(base * c_factor))
 
 
 def verify_opt_tpcds(
@@ -346,10 +433,17 @@ def verify_opt_tpcds(
     if span is None:
         return False
     start_k, stop_k, _ = span
-    start_data = load_tpcds_ckpt_stage(start_k) if start_k is not None else load_tpcds_ckpt_stage(0)
+    need_indices = (set(case_indices) - (skip_indices or set())) if case_indices is not None else None
+    if need_indices is not None and not need_indices:
+        return True
+    start_data = (
+        load_tpcds_ckpt_stage(start_k, indices=need_indices, for_exec=False)
+        if start_k is not None
+        else load_tpcds_ckpt_stage(0, indices=need_indices, for_exec=False)
+    )
     if start_data is None:
         return False
-    stop_data = load_tpcds_ckpt_stage(stop_k) if stop_k is not None else None
+    stop_data = load_tpcds_ckpt_stage(stop_k, indices=need_indices, for_exec=False) if stop_k is not None else None
     if stop_k is not None and stop_data is None:
         return False
 
@@ -378,8 +472,7 @@ def verify_opt_tpcds(
         if (
             skip_indices
             and stop_k is not None
-            and stop_k <= 7
-            and all("leave_tables_isolated" not in (src or "") for src in patched_files.values())
+            and (stop_k == 0 or (stop_k <= 7 and all("leave_tables_isolated" not in (src or "") for src in patched_files.values())))
         )
         else None
     )
@@ -500,6 +593,15 @@ def _rows_equal(cols_a, rows_a, cols_b, rows_b) -> bool:
     return True
 
 
+def _open_prebuilt_duckdb(suite_name: str):
+    import duckdb
+
+    db_file = TPCDS_DUCKDB_FILE if suite_name == "tpcds" else TPCH_DUCKDB_FILE
+    if db_file.is_file():
+        return duckdb.connect(str(db_file), read_only=True)
+    return None
+
+
 def _same_duckdb_results(suite_name: str, pairs: list[tuple[str, str]]) -> bool:
     """True if each patched DuckDB SQL returns exactly what the pinned one does.
 
@@ -509,19 +611,20 @@ def _same_duckdb_results(suite_name: str, pairs: list[tuple[str, str]]) -> bool:
     """
     if len(pairs) > TPC_REEXEC_MAX_QUERIES:
         return False
-    import duckdb
-    from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, TPCH_SCHEMA
+    conn = _open_prebuilt_duckdb(suite_name)
+    if conn is None:
+        import duckdb
+        from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, TPCH_SCHEMA
 
-    schema, folder = (TPCDS_SCHEMA, "tpc-ds") if suite_name == "tpcds" else (TPCH_SCHEMA, "tpc-h")
-    t0 = time.process_time()
-    conn = duckdb.connect()
-    try:
-        # Same views as TestExecutor.setUpClass.
+        schema, folder = (TPCDS_SCHEMA, "tpc-ds") if suite_name == "tpcds" else (TPCH_SCHEMA, "tpc-h")
+        conn = duckdb.connect()
         for table, columns in schema.items():
             conn.execute(
                 f"CREATE VIEW {table} AS SELECT * FROM READ_CSV("
                 f"'{FIXTURES_DIR}/optimizer/{folder}/{table}.csv.gz', delim='|', header=True, columns={columns})"
             )
+    t0 = time.process_time()
+    try:
         for new_sql, old_sql in pairs:
             if time.process_time() - t0 > TPC_REEXEC_BUDGET_S:
                 return False
@@ -577,6 +680,7 @@ def verify_tpc_test(
         ensured_schema = ensure_schema(s1["schema"])
         s2_meta: dict | None = None
         s2_tables_cache: dict[str, list] = {}
+        s2_table_objs_cache: dict[str, Table] = {}
         s2_full_cache: list = []
 
         skip_opt = False
@@ -594,12 +698,17 @@ def verify_tpc_test(
         start_layouts: list | None = None
         stop_dumps_b: list | None = None
         stop_dumps: list | None = None
+        exec_ckpt14_data: dict | None = None
+        slice_indices: set[int] | None = None
+        if query_mask is not None:
+            slice_indices = {i for i in range(len(s1["queries"])) if query_mask >> i & 1}
         if suite_name == "tpcds" and _all_tpc_safe(patched_files, for_exec=True):
             meta = load_tpcds_ckpts_meta()
             if meta is not None:
+                has_exec_ckpts = bool(meta.get("exec_checkpoints"))
                 bits = _touched_stage_bits(meta, patched_files, edited_spans)
                 if bits is not None:
-                    opt_mask = ((1 << 16) - 1) | (1 << 21)
+                    opt_mask = _EXEC_OPT_MASK if has_exec_ckpts else (((1 << 16) - 1) | (1 << 21))
                     skip_opt = (bits & opt_mask) == 0
                     skip_duck = (bits & ((1 << 18) | (1 << 21))) == 0
                     plan_untouched = (bits & ((1 << 16) | (1 << 21))) == 0
@@ -613,14 +722,19 @@ def verify_tpc_test(
                     plan_untouched = patched_set.isdisjoint(meta["s1_plan_files"])
                     skip_plan = skip_opt and plan_untouched
                     skip_pygen = patched_set.isdisjoint(meta["s1_pygen_files"])
+                if skip_opt and not skip_plan and has_exec_ckpts:
+                    exec_ckpt14_data = load_tpcds_ckpt_stage(14, indices=slice_indices, for_exec=True)
                 if not skip_opt:
                     span = select_tpcds_span(
-                        patched_files, max_start=7, for_exec=True, edited_spans=edited_spans
+                        patched_files,
+                        max_start=14 if has_exec_ckpts else 7,
+                        for_exec=True,
+                        edited_spans=edited_spans,
                     )
                     if span is not None:
                         s_k, e_k, _ = span
                         if s_k is not None:
-                            s_data = load_tpcds_ckpt_stage(s_k)
+                            s_data = load_tpcds_ckpt_stage(s_k, indices=slice_indices, for_exec=(s_k >= 8))
                             # A bare serde load drops the empty lists the planner reads (joins=[] plans
                             # a Join step): without layouts to restore them, only start from a
                             # checkpoint when planning is untouched (equal dumps then suffice).
@@ -630,7 +744,8 @@ def verify_tpc_test(
                                 start_dumps = s_data.get("dumps")
                                 start_layouts = s_data.get("layouts_b")
                         if e_k is not None:
-                            e_data = load_tpcds_ckpt_stage(e_k)
+                            e_idx = None if (e_k == 0 and unchanged_out is not None and query_mask is None) else slice_indices
+                            e_data = load_tpcds_ckpt_stage(e_k, indices=e_idx, for_exec=(e_k >= 8))
                             if e_data is not None:
                                 stop_k = e_k
                                 stop_dumps_b = e_data.get("dumps_b")
@@ -659,10 +774,12 @@ def verify_tpc_test(
                 schema_map = s2_meta["schema"]
                 tables = {}
                 for name in q2["table_names"]:
-                    if name not in s2_tables_cache:
-                        with open(tpc_s2_table_file(suite_name, name), "rb") as handle:
-                            s2_tables_cache[name] = pickle.load(handle)
-                    tables[name] = Table(columns=schema_map[name], rows=list(s2_tables_cache[name]))
+                    if name not in s2_table_objs_cache:
+                        if name not in s2_tables_cache:
+                            with open(tpc_s2_table_file(suite_name, name), "rb") as handle:
+                                s2_tables_cache[name] = pickle.load(handle)
+                        s2_table_objs_cache[name] = Table(columns=schema_map[name], rows=list(s2_tables_cache[name]))
+                    tables[name] = s2_table_objs_cache[name]
                 if plan is not None:
                     res = PythonExecutor(tables=ensure_tables(tables)).execute(plan)
                 elif opt_expr is not None:
@@ -692,12 +809,13 @@ def verify_tpc_test(
         duck_count = 0
         duck_cpu = 0.0
         duck_conn = None
+        duck_is_prebuilt = False
         duck_loaded_tables: set[str] = set()
         reexec_count = 0
         reexec_cpu = 0.0
 
         def _check_changed_duck(index: int, new_sql: str, old_sql: str, table_names: list[str]) -> bool:
-            nonlocal duck_count, duck_cpu, duck_conn
+            nonlocal duck_count, duck_cpu, duck_conn, duck_is_prebuilt
             duck_count += 1
             if duck_count > TPC_DUCK_MAX_QUERIES or duck_cpu > TPC_DUCK_BUDGET_S:
                 _why(f"{suite_name}: duckdb limit ({duck_count} queries, {duck_cpu:.2f}s)")
@@ -708,17 +826,22 @@ def verify_tpc_test(
 
                 schema, folder = (TPCDS_SCHEMA, "tpc-ds") if suite_name == "tpcds" else (TPCH_SCHEMA, "tpc-h")
                 if duck_conn is None:
-                    import duckdb
+                    pre = _open_prebuilt_duckdb(suite_name)
+                    if pre is not None:
+                        duck_conn = pre
+                        duck_is_prebuilt = True
+                    else:
+                        import duckdb
 
-                    duck_conn = duckdb.connect()
-                # Lazily materialize only referenced tables into memory once (~9x faster than CREATE VIEW).
-                for table in table_names:
-                    if table not in duck_loaded_tables and table in schema:
-                        duck_conn.execute(
-                            f"CREATE TABLE {table} AS SELECT * FROM READ_CSV("
-                            f"'{FIXTURES_DIR}/optimizer/{folder}/{table}.csv.gz', delim='|', header=True, columns={schema[table]})"
-                        )
-                        duck_loaded_tables.add(table)
+                        duck_conn = duckdb.connect()
+                if not duck_is_prebuilt:
+                    for table in table_names:
+                        if table not in duck_loaded_tables and table in schema:
+                            duck_conn.execute(
+                                f"CREATE TABLE {table} AS SELECT * FROM READ_CSV("
+                                f"'{FIXTURES_DIR}/optimizer/{folder}/{table}.csv.gz', delim='|', header=True, columns={schema[table]})"
+                            )
+                            duck_loaded_tables.add(table)
                 new = duck_conn.execute(new_sql)
                 new_desc, new_rows = [d[:2] for d in new.description], new.fetchall()
                 old = duck_conn.execute(old_sql)
@@ -752,7 +875,23 @@ def verify_tpc_test(
                 return False
             reexec_est_ms += q_est
             t0 = time.process_time()
-            ok = same_rows_as_pinned(index, sql, opt_expr, plan=plan)
+            # Guard against a mutant slowing a single query into a 50s hang while preserving outer alarm.
+            rem_cpu_s = max(1.0, TPC_REEXEC_BUDGET_S - reexec_cpu)
+            q_limit_s = max(2, min(int(rem_cpu_s) + 1, max(3, int(q_est * 5 / 1000) + 2)))
+            prev_rem = signal.alarm(0)
+            outer_dl = (time.monotonic() + prev_rem) if prev_rem > 0 else None
+            if outer_dl is not None:
+                q_limit_s = min(q_limit_s, max(1, prev_rem))
+            signal.alarm(q_limit_s)
+            try:
+                ok = same_rows_as_pinned(index, sql, opt_expr, plan=plan)
+            except BaseException:
+                ok = False
+            finally:
+                signal.alarm(0)
+                if outer_dl is not None:
+                    left_s = int(math.ceil(outer_dl - time.monotonic()))
+                    signal.alarm(max(1, left_s))
             reexec_cpu += time.process_time() - t0
             if not ok:
                 _why(f"{suite_name} q{index}: rows differ")
@@ -771,6 +910,14 @@ def verify_tpc_test(
             """True if `opt_expr` plans like the pinned query, else if re-executing it gives the pinned rows."""
             nonlocal py_gen_sig
             plan = Plan(opt_expr)
+            if live and q.get("plan_sig_py") is not None:
+                if py_gen_sig is None:
+                    py_gen_sig = Python().generator(identify=True, comments=False)
+                try:
+                    if py_plan_signature(plan, py_gen_sig) == q["plan_sig_py"]:
+                        return True
+                except Exception:
+                    pass
             if plan_signature(plan, serde_dump) == q["plan_sig"]:
                 return True
             if not live:
@@ -783,9 +930,7 @@ def verify_tpc_test(
             if exec_dump is not None and q.get("plan_sig_x") is not None:
                 if plan_signature(plan, exec_dump) == q["plan_sig_x"]:
                     return True
-            # Compiled-Python Plan signature: proves bit-for-bit identical PythonExecutor bytecode
-            # & tables/columns (ignores unused node.type, node.meta, and cosmetic AST diffs).
-            if q.get("plan_sig_py") is not None:
+            if not live and q.get("plan_sig_py") is not None:
                 if py_gen_sig is None:
                     py_gen_sig = Python().generator(identify=True, comments=False)
                 try:
@@ -810,8 +955,18 @@ def verify_tpc_test(
                                 if not _check_changed_duck(index, duck_sql, q["duckdb_sql"], q["table_names"]):
                                     return False
                         if not skip_plan:
-                            opt_expr = optimize(parse_one(q["sql"]), ensured_schema, leave_tables_isolated=True)
-                            if not _same_plan_or_rows(index, q, opt_expr, live=True):
+                            opt_expr = None
+                            live_ast = True
+                            if exec_ckpt14_data is not None:
+                                db14 = exec_ckpt14_data["dumps_b"][index]
+                                lb14 = exec_ckpt14_data["layouts_b"][index]
+                                if db14 is not None and lb14 is not None:
+                                    cand_expr = serde_load(pickle.loads(db14))
+                                    if ast_restore(cand_expr, pickle.loads(lb14)):
+                                        opt_expr = cand_expr
+                            if opt_expr is None:
+                                opt_expr = optimize(parse_one(q["sql"]), ensured_schema, leave_tables_isolated=True)
+                            if not _same_plan_or_rows(index, q, opt_expr, live=live_ast):
                                 return False
                         continue
 
@@ -872,6 +1027,14 @@ def verify_tpc_test(
                     else:
                         expr = parse_one(q["sql"])
                         if not q["execute"]:
+                            if (
+                                stop_k == 0
+                                and unchanged_out is not None
+                                and stop_dumps_b is not None
+                                and stop_dumps_b[index] is not None
+                                and serde_dump(expr) == pickle.loads(stop_dumps_b[index])
+                            ):
+                                unchanged_out.add(index)
                             continue
                         if sorted({t.name for t in find_tables(expr)}) != q["table_names"]:
                             _why(f"{suite_name} q{index}: tables changed")
@@ -1099,7 +1262,32 @@ def tokenizer_edit_position_free(sel: Selection) -> bool:
     return True
 
 
-def verify_max_nodes(patched_files: dict[str, str], position_free: bool = False) -> bool:
+def tokenizer_edit_touches_max_nodes(sel: Selection) -> bool:
+    """True if edited spans intersect lines executed by SELECT x=x=x tokenization (or unknown)."""
+    tok_files = [
+        p for p in sel.patched_files if p in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/trie.py")
+    ]
+    if not tok_files:
+        return False
+    if sel.edited_spans is None:
+        return True
+    meta = load_tpcds_ckpts_meta()
+    tok_lines = meta.get("max_nodes_tok_lines") if meta else None
+    if not tok_lines:
+        return True
+    for path, first, last in sel.edited_spans:
+        if path in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/trie.py"):
+            hit_set = tok_lines.get(path)
+            if not hit_set or any(first <= ln <= last for ln in hit_set):
+                return True
+    return False
+
+
+def verify_max_nodes(
+    patched_files: dict[str, str],
+    position_free: bool = False,
+    tok_untouched: bool = False,
+) -> bool:
     """Verify TestParser.test_max_nodes without parsing its 10000-column query (~0.2s vs ~12s).
 
     Every column of the test's `SELECT x=x=...=x, ...` is the same 202-token pattern, so the
@@ -1134,7 +1322,9 @@ def verify_max_nodes(patched_files: dict[str, str], position_free: bool = False)
     def prefix_sql(cols: int) -> str:
         return f"SELECT {','.join(expr for _ in range(cols))}"
 
-    if any(p in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py") for p in patched_files):
+    if not tok_untouched and any(
+        p in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/trie.py") for p in patched_files
+    ):
         # When the patched tokenizer function is position/count-independent, checking 3 columns
         # proves the 202-token periodic pattern holds for all 10,000 columns in ~5ms vs ~16.5s.
         chk_w = 3 if position_free else width
@@ -1164,14 +1354,29 @@ def verify_max_nodes(patched_files: dict[str, str], position_free: bool = False)
 
     def limit_error(skip_cols: int, parse_cols: int, max_nodes: int) -> str | None:
         """parse_one of `parse_cols` columns with the counter starting `skip_cols` columns in."""
+        sql = prefix_sql(parse_cols)
 
         def fast_forward_reset(self) -> None:
             orig_reset(self)
             self._node_count = skip_cols * per_col
 
-        parser_cls.reset = fast_forward_reset
         try:
-            parse_one(prefix_sql(parse_cols), max_nodes=max_nodes)
+            parser_cls.reset = fast_forward_reset
+        except TypeError:
+            # Mypyc-compiled Parser types forbid class attribute assignment; subclass instead.
+            class _FFParser(parser_cls):  # type: ignore[misc,valid-type]
+                def reset(self) -> None:
+                    super().reset()
+                    self._node_count = skip_cols * per_col
+
+            try:
+                _FFParser(dialect=dialect, max_nodes=max_nodes).parse(dialect.tokenize(sql), sql)
+                return None
+            except ParseError as error:
+                return str(error)
+
+        try:
+            parse_one(sql, max_nodes=max_nodes)
             return None
         except ParseError as error:
             return str(error)

@@ -246,44 +246,65 @@ class _Rewriter(ast.NodeTransformer):
 
     visit_FunctionDef = visit_AsyncFunctionDef = visit_Lambda = _scoped
 
+    def _wrap_expr(self, node: ast.expr, is_bare: bool = False):
+        spec, atoms, nslots = vs.build(node)
+        if not vs.instrumentable(atoms):
+            return self.visit(node) if is_bare else super().visit(node)
+        key = vs.site_key(node)
+        pure = all(vs.is_pure(a) for a in atoms)
+        widths = {}
+
+        def wwalk(s):
+            k = s[0]
+            if k == "A":
+                widths[s[2]] = 1
+            elif k == "N":
+                wwalk(s[1])
+            elif k in "&|":
+                for c in s[1]:
+                    wwalk(c)
+            else:
+                for sl in s[3]:
+                    widths[sl] = len(vs.RELS)
+
+        wwalk(spec)
+        sid = len(_SPECS)
+        _SPECS.append((spec, nslots, pure, self.rel, key, widths))
+        self.count += 1
+        lambdas = []
+        for atom in atoms:
+            new_atom = self.visit(atom)
+            lam = ast.Lambda(
+                args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
+                body=new_atom,
+            )
+            lambdas.append(lam)
+        call = ast.Call(
+            func=ast.Name(id="_br_vp", ctx=ast.Load()),
+            args=[ast.Constant(sid), ast.Tuple(elts=lambdas, ctx=ast.Load())],
+            keywords=[],
+        )
+        return ast.copy_location(call, node)
+
+    def _visit_test_node(self, node):
+        if self.depth > 0 and isinstance(node.test, ast.expr) and not vs.is_logic(node.test):
+            node.test = self._wrap_expr(node.test, is_bare=True)
+            for name, value in ast.iter_fields(node):
+                if name == "test":
+                    continue
+                if isinstance(value, list):
+                    node_list = [self.visit(item) if isinstance(item, ast.AST) else item for item in value]
+                    setattr(node, name, node_list)
+                elif isinstance(value, ast.AST):
+                    setattr(node, name, self.visit(value))
+            return node
+        return self.generic_visit(node)
+
+    visit_If = visit_While = visit_IfExp = _visit_test_node
+
     def visit(self, node):
         if self.depth > 0 and isinstance(node, ast.expr) and vs.is_logic(node):
-            spec, atoms, nslots = vs.build(node)
-            if vs.instrumentable(atoms):
-                pure = all(vs.is_pure(a) for a in atoms)
-                widths = {}
-
-                def wwalk(s):
-                    k = s[0]
-                    if k == "A":
-                        widths[s[2]] = 1
-                    elif k == "N":
-                        wwalk(s[1])
-                    elif k in "&|":
-                        for c in s[1]:
-                            wwalk(c)
-                    else:
-                        for sl in s[3]:
-                            widths[sl] = len(vs.RELS)
-
-                wwalk(spec)
-                sid = len(_SPECS)
-                _SPECS.append((spec, nslots, pure, self.rel, vs.site_key(node), widths))
-                self.count += 1
-                lambdas = []
-                for atom in atoms:
-                    new_atom = self.visit(atom)
-                    lam = ast.Lambda(
-                        args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
-                        body=new_atom,
-                    )
-                    lambdas.append(lam)
-                call = ast.Call(
-                    func=ast.Name(id="_br_vp", ctx=ast.Load()),
-                    args=[ast.Constant(sid), ast.Tuple(elts=lambdas, ctx=ast.Load())],
-                    keywords=[],
-                )
-                return ast.copy_location(call, node)
+            return self._wrap_expr(node, is_bare=False)
         return super().visit(node)
 
 

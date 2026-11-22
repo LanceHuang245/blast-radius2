@@ -35,7 +35,7 @@ PURE_METHODS = frozenset(
         "get", "startswith", "endswith", "upper", "lower", "isupper", "islower", "isdigit", "isalpha",
         "isalnum", "isidentifier", "isspace", "strip", "lstrip", "rstrip", "text", "is_type", "keys",
         "values", "items", "count", "issubset", "issuperset", "isdisjoint", "arg_key", "find_ancestor",
-        "copy",
+        "copy", "meta_get", "find", "find_all", "unnest", "sql_name", "sql_names", "to_py",
     }
 )
 # Properties that lazily cache derived state: evaluating them early could change later behavior.
@@ -121,8 +121,23 @@ def is_pure(atom: ast.expr) -> bool:
     return True
 
 
+def is_bare_test(node: ast.AST, parent, field) -> bool:
+    """True for non-logic test expressions on If/While/IfExp whose truthiness controls execution."""
+    return (
+        isinstance(node, ast.expr)
+        and not is_logic(node)
+        and field == "test"
+        and isinstance(parent, (ast.If, ast.While, ast.IfExp))
+    )
+
+
+def is_recorded_site(node: ast.AST, parent, field) -> bool:
+    """True if node is instrumented as a condition site (either logic tree or bare If/While/IfExp test)."""
+    return isinstance(node, ast.expr) and (is_logic(node) or is_bare_test(node, parent, field))
+
+
 def iter_sites(tree: ast.AST):
-    """Yield (root, parent, field, depth) for every maximal logic node, outermost first.
+    """Yield (root, parent, field, depth) for every condition site, outermost first.
     depth counts enclosing function/lambda scopes (0: module or class body)."""
 
     def visit(node: ast.AST, depth: int, parent, field):
@@ -132,6 +147,8 @@ def iter_sites(tree: ast.AST):
             for atom in atoms:
                 yield from visit(atom, depth, node, "atom")
             return
+        if is_bare_test(node, parent, field):
+            yield node, parent, field, depth
         inner = depth + 1 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) else depth
         for name, value in ast.iter_fields(node):
             if isinstance(value, list):

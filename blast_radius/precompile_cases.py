@@ -40,10 +40,20 @@ TPC_S2_BLOBS_DIR = APP / "map" / "tpc_s2_blobs"
 TPCDS_CKPT_DIR = APP / "map"
 OPT_TEST_FILE = "tests/test_optimizer.py"
 TPCDS_CKPT_STAGES = (0, 1, 3, 5, 7, 8, 12, 14)
+TPCDS_EXEC_CKPT_STAGES = (8, 9, 10, 11, 12, 13, 14)
 
 
-def tpcds_ckpt_stage_file(stage: int):
-    return TPCDS_CKPT_DIR / f"tpcds_ckpt_{stage}.pkl"
+def tpcds_ckpt_stage_file(stage: int, for_exec: bool = False):
+    prefix = "tpcds_exec_ckpt_" if for_exec else "tpcds_ckpt_"
+    return TPCDS_CKPT_DIR / f"{prefix}{stage}.pkl"
+
+
+def tpcds_ckpt_bin_files(stage: int, for_exec: bool = False):
+    prefix = "tpcds_exec_ckpt_" if for_exec else "tpcds_ckpt_"
+    return (
+        TPCDS_CKPT_DIR / f"{prefix}{stage}.meta",
+        TPCDS_CKPT_DIR / f"{prefix}{stage}.bin",
+    )
 
 
 def tpc_s2_table_file(suite: str, table_name: str):
@@ -1125,22 +1135,69 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
     _, g_files, sql_ms = _run_stage(17, lambda: [e.sql(pretty=True) for e in exprs])
     gen_files = g_files | {"sqlglot/serde.py"}
 
-    # Bit 15: RULES[7:] with leave_tables_isolated=True (test_execute_tpcds).
+    # Bits 22..28: RULES[7..13] with leave_tables_isolated=True on the 57 execute=True queries,
+    # saving per-stage exec checkpoints (8..14) so fast_a starts/stops at any rule!
     exec_tail_files: set[str] = set()
-    if 7 in ckpt_data:
-        exec_exprs = [serde_load(pickle.loads(db)) for db in ckpt_data[7]["dumps_b"]]
+    exec_ckpt_data: dict[int, dict] = {}
+    exec_rule_times_ms: list[float] = []
+    exec_rule_files: list[set[str]] = []
+    s1_tpcds_pre = s1_all.get("tpcds")
+    exec_indices = (
+        [i for i, q in enumerate(s1_tpcds_pre["queries"]) if q["execute"]]
+        if s1_tpcds_pre
+        else []
+    )
+    if 7 in ckpt_data and exec_indices:
+        exec_exprs = [serde_load(pickle.loads(ckpt_data[7]["dumps_b"][i])) for i in exec_indices]
         exec_kw = {**kw, "leave_tables_isolated": True}
+        exec_cum_files = set(ckpt_data[7]["files"])
+        n_q = len(sqls)
 
-        def _run_exec_tail():
-            cur = exec_exprs
-            for rule in RULES[7:]:
-                params = inspect.getfullargspec(rule).args
-                rkw = {p: exec_kw[p] for p in params if p in exec_kw}
-                cur = [rule(e, **rkw) for e in cur]
-            return cur
+        def _pack_exec_ckpt(cur_list: list) -> tuple[list, list]:
+            dumps_out: list = [None] * n_q
+            layouts_out: list = [None] * n_q
+            for q_idx, e_obj in zip(exec_indices, cur_list):
+                dumps_out[q_idx] = pickle.dumps(serde_dump(e_obj), protocol=4)
+                layouts_out[q_idx] = pickle.dumps(ast_layout(e_obj), protocol=4)
+            return dumps_out, layouts_out
 
-        _, et_files, _ = _run_stage(15, _run_exec_tail)
-        exec_tail_files = et_files | base_opt_files | schema_files
+        for r_idx in range(7, len(RULES)):
+            rule = RULES[r_idx]
+            params = inspect.getfullargspec(rule).args
+            rkw = {p: exec_kw[p] for p in params if p in exec_kw}
+            exec_exprs, er_files, er_ms = _run_stage(
+                22 + (r_idx - 7),
+                lambda r=rule, rk=rkw, es=exec_exprs: [r(e, **rk) for e in es],
+            )
+            exec_rule_times_ms.append(er_ms)
+            exec_rule_files.append(er_files | base_opt_files | schema_files)
+            exec_tail_files |= er_files
+            exec_cum_files |= er_files
+            stage_k = r_idx + 1
+            if stage_k in TPCDS_EXEC_CKPT_STAGES:
+                d_out, l_out = _pack_exec_ckpt(exec_exprs)
+                exec_ckpt_data[stage_k] = {
+                    "files": sorted(exec_cum_files),
+                    "dumps_b": d_out,
+                    "layouts_b": l_out,
+                }
+        exec_tail_files |= base_opt_files | schema_files
+
+    # Also record exact tokenizer lines exercised by test_max_nodes's SELECT x=x=x pattern.
+    from sqlglot import Dialect as _Dialect
+
+    _tok_d = _Dialect.get_or_raise(None)
+    cur_lines.clear()
+    recording[0] = True
+    mon.restart_events()
+    mon.set_events(tool, mon.events.LINE)
+    _tok_d.tokenize("SELECT x=x=x,x=x=x,x=x=x")
+    mon.set_events(tool, 0)
+    recording[0] = False
+    max_nodes_tok_lines: dict[str, list[int]] = defaultdict(list)
+    for rel, ln in sorted(cur_lines):
+        if rel in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/trie.py"):
+            max_nodes_tok_lines[rel].append(ln)
 
     s1_tpcds = s1_all.get("tpcds")
     s1_duck_files: set[str] = set()
@@ -1179,14 +1236,24 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
         entry["suffix_files"] = sorted(suffix_opt)
         entry["suffix_exec_files"] = sorted(suffix_opt | exec_tail_files) if k <= 7 else sorted(suffix_opt)
 
+    for k, entry in exec_ckpt_data.items():
+        rem_exec_ms = sum(exec_rule_times_ms[k - 7 :]) * 0.85 + 35.0
+        entry["est_ms"] = max(60, round(rem_exec_ms))
+        suffix_exec: set[str] = set()
+        for rf in exec_rule_files[k - 7 :]:
+            suffix_exec |= rf
+        entry["suffix_exec_files"] = sorted(suffix_exec)
+
     ckpts_payload = {
         "sqls": sqls,
         "expected": expected,
         "schema": TPCDS_SCHEMA,
         "checkpoints": ckpt_data,
+        "exec_checkpoints": exec_ckpt_data,
         "stage_lines": dict(stage_lines),
         "s2b_query_ms": s2b_query_ms_by_suite,
         "rule_times_ms": [round(x, 1) for x in rule_times_ms],
+        "exec_rule_times_ms": [round(x, 1) for x in exec_rule_times_ms],
         "sql_ms": round(sql_ms, 1),
         "gen_files": sorted(gen_files),
         "parse_files": sorted(parse_files),
@@ -1194,8 +1261,106 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
         "s1_duck_files": sorted(s1_duck_files | {"sqlglot/serde.py"}),
         "s1_plan_files": sorted(s1_plan_files | {"sqlglot/serde.py"}),
         "s1_pygen_files": sorted(s1_pygen_files | {"sqlglot/serde.py"}),
+        "max_nodes_tok_lines": dict(max_nodes_tok_lines),
     }
     return per_tpc, ckpts_payload
+
+
+def _record_db_cache_child() -> int:
+    """Run DB-backed tests under install_db_recorder() in an isolated child and write db_cache.pkl."""
+    from blast_radius import verify as V
+    from blast_radius.db_cache import install_db_recorder, restore_orig_db_connect, save_db_cache
+
+    install_db_recorder()
+    V._SKIP_POOL_PICKLE = True
+    V._patch_pool_references()
+
+    import tests.test_optimizer as T_opt
+    import tests.test_optimize_cross_joins as T_cj
+    import tests.test_simplify_between as T_sb
+    import tests.dialects.test_sqlite as T_sq
+
+    V._patch_pool_references()
+    T_opt.TestOptimizer.setUpClass()
+    try:
+        src_opt = (SOURCE / "tests" / "test_optimizer.py").read_text(encoding="utf-8")
+        tree_opt = ast.parse(src_opt)
+        lines_opt = src_opt.splitlines()
+        for node in ast.walk(tree_opt):
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+                body = "\n".join(lines_opt[node.lineno - 1 : node.end_lineno])
+                if any(k in body for k in ("duckdb.connect", "self.conn", "sqlite3.connect", "execute=True")):
+                    r = unittest.TestResult()
+                    T_opt.TestOptimizer(node.name).run(r)
+
+        for cls in (T_cj.TestOptimizeCrossJoins, T_sb.TestSimplifyBetween, T_sq.TestSQLite):
+            if hasattr(cls, "setUpClass"):
+                cls.setUpClass()
+            for name in sorted(dir(cls)):
+                if name.startswith("test_"):
+                    r = unittest.TestResult()
+                    cls(name).run(r)
+        return save_db_cache()
+    finally:
+        restore_orig_db_connect()
+
+
+def _write_ckpt_bin(stage: int, entry: dict, expected: list, schema: dict, sqls: list | None, for_exec: bool) -> int:
+    """Write offset-indexed .meta + .bin files so children only unpickle needed query indices."""
+    meta_path, bin_path = tpcds_ckpt_bin_files(stage, for_exec=for_exec)
+    dumps_b = entry["dumps_b"]
+    layouts_b = entry["layouts_b"]
+    offsets: list[tuple[int, int] | None] = []
+    cur_off = 0
+    with open(bin_path, "wb") as bf:
+        for db, lb in zip(dumps_b, layouts_b):
+            if db is None:
+                offsets.append(None)
+                continue
+            rec = pickle.dumps((db, lb), protocol=pickle.HIGHEST_PROTOCOL)
+            bf.write(rec)
+            offsets.append((cur_off, len(rec)))
+            cur_off += len(rec)
+    meta = {
+        "offsets": offsets,
+        "expected": expected,
+        "schema": schema,
+    }
+    if sqls is not None:
+        meta["sqls"] = sqls
+    with open(meta_path, "wb") as mf:
+        pickle.dump(meta, mf, protocol=pickle.HIGHEST_PROTOCOL)
+    return bin_path.stat().st_size + meta_path.stat().st_size
+
+
+def _intern_cases(all_cases: dict[str, dict]) -> dict:
+    """Intern bitmasks in cases.marshal into a shared little-endian bytes table."""
+    seen: dict[int, int] = {}
+    sets_bytes: list[bytes] = []
+
+    def intern(m: int) -> int:
+        idx = seen.get(m)
+        if idx is None:
+            idx = len(sets_bytes)
+            seen[m] = idx
+            sets_bytes.append(m.to_bytes((m.bit_length() + 7) // 8, "little"))
+        return idx
+
+    compacted: dict[str, dict] = {}
+    for tid, entry in all_cases.items():
+        ne = dict(entry)
+        if "lines" in ne:
+            ne["lines"] = {
+                rel: {ln: intern(m) for ln, m in per.items()}
+                for rel, per in ne["lines"].items()
+            }
+        if "s2b_lines" in ne:
+            ne["s2b_lines"] = {
+                rel: {ln: intern(m) for ln, m in per.items()}
+                for rel, per in ne["s2b_lines"].items()
+            }
+        compacted[tid] = ne
+    return {"interned": True, "sets": sets_bytes, "cases": compacted}
 
 
 def main() -> None:
@@ -1205,14 +1370,24 @@ def main() -> None:
     os.chdir(SOURCE)
     sys.path.insert(0, str(SOURCE))
     from blast_radius import verify as V
+    from blast_radius.db_cache import build_tpc_duckdb_files
     from blast_radius.import_state import import_all_sqlglot
+
+    # Spawn DB cache recorder BEFORE importing tests in parent.
+    pid_db = os.fork()
+    if pid_db == 0:
+        try:
+            n_db = _record_db_cache_child()
+            print(f"precompile_cases: recorded {n_db} DB cache entries", file=sys.stderr)
+        finally:
+            os._exit(0)
 
     import_all_sqlglot()
     V._SKIP_POOL_PICKLE = True
     V._patch_pool_references()
     src_prefix = str(SOURCE.resolve()) + "/sqlglot/"
 
-    # Run the 3 independent build-time recorders in parallel via fork() for ~2.5-3x faster builds.
+    # Run the independent build-time recorders in parallel via fork() for ~3x faster builds.
     gc.freeze()
     opt_tmp = "/tmp/_br_pc_opt.marshal"
     val_tmp = "/tmp/_br_pc_val.marshal"
@@ -1252,10 +1427,13 @@ def main() -> None:
         mon.set_events(tool, 0)
         mon.free_tool_id(tool)
 
+    build_tpc_duckdb_files(SOURCE)
+
     _, st_opt = os.waitpid(pid_opt, 0)
     _, st_val = os.waitpid(pid_val, 0)
-    if st_opt != 0 or st_val != 0:
-        raise RuntimeError(f"precompile_cases child failed: opt={st_opt} val={st_val}")
+    _, st_db = os.waitpid(pid_db, 0)
+    if st_opt != 0 or st_val != 0 or st_db != 0:
+        raise RuntimeError(f"precompile_cases child failed: opt={st_opt} val={st_val} db={st_db}")
 
     opt_cases = marshal.loads(open(opt_tmp, "rb").read())
     val_cases = marshal.loads(open(val_tmp, "rb").read())
@@ -1266,25 +1444,19 @@ def main() -> None:
             pass
 
     all_cases = {**opt_cases, **val_cases, **tpc_cases}
-    CASES_FILE.write_bytes(marshal.dumps(all_cases))
+    CASES_FILE.write_bytes(marshal.dumps(_intern_cases(all_cases)))
 
-    # Write tiny metadata file (~6KB) for parent planning and per-stage dump files where each
-    # query dump is an individual bytes blob so loading a few queries takes ~2ms instead of 1.1s.
     ckpt_meta = {}
     ckpt_bytes = 0
     for k, entry in ckpts_payload["checkpoints"].items():
-        stage_file = tpcds_ckpt_stage_file(k)
-        payload = {
-            "dumps_b": entry["dumps_b"],
-            "layouts_b": entry["layouts_b"],
-            "expected": ckpts_payload["expected"],
-            "schema": ckpts_payload["schema"],
-        }
-        if k == 0:
-            payload["sqls"] = ckpts_payload["sqls"]
-        with open(stage_file, "wb") as handle:
-            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
-        ckpt_bytes += stage_file.stat().st_size
+        ckpt_bytes += _write_ckpt_bin(
+            k,
+            entry,
+            ckpts_payload["expected"],
+            ckpts_payload["schema"],
+            ckpts_payload["sqls"] if k == 0 else None,
+            for_exec=False,
+        )
         ckpt_meta[k] = {
             "files": entry["files"],
             "suffix_files": entry["suffix_files"],
@@ -1292,11 +1464,29 @@ def main() -> None:
             "est_ms": entry["est_ms"],
         }
 
+    exec_ckpt_meta = {}
+    for k, entry in ckpts_payload["exec_checkpoints"].items():
+        ckpt_bytes += _write_ckpt_bin(
+            k,
+            entry,
+            ckpts_payload["expected"],
+            ckpts_payload["schema"],
+            None,
+            for_exec=True,
+        )
+        exec_ckpt_meta[k] = {
+            "files": entry["files"],
+            "suffix_exec_files": entry["suffix_exec_files"],
+            "est_ms": entry["est_ms"],
+        }
+
     meta_payload = {
         "checkpoints": ckpt_meta,
+        "exec_checkpoints": exec_ckpt_meta,
         "stage_lines": ckpts_payload["stage_lines"],
         "s2b_query_ms": ckpts_payload["s2b_query_ms"],
         "rule_times_ms": ckpts_payload["rule_times_ms"],
+        "exec_rule_times_ms": ckpts_payload["exec_rule_times_ms"],
         "sql_ms": ckpts_payload["sql_ms"],
         "gen_files": ckpts_payload["gen_files"],
         "parse_files": ckpts_payload["parse_files"],
@@ -1304,6 +1494,7 @@ def main() -> None:
         "s1_duck_files": ckpts_payload["s1_duck_files"],
         "s1_plan_files": ckpts_payload["s1_plan_files"],
         "s1_pygen_files": ckpts_payload["s1_pygen_files"],
+        "max_nodes_tok_lines": ckpts_payload["max_nodes_tok_lines"],
     }
     with open(TPCDS_CKPTS_META_FILE, "wb") as handle:
         pickle.dump(meta_payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
