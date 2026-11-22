@@ -68,7 +68,7 @@ MIN_GAIN_MS = int(os.environ.get("BR_MIN_GAIN_MS", "300"))
 MIN_DECAP_GAIN_MS = int(os.environ.get("BR_MIN_DECAP_GAIN_MS", "550"))
 MIN_ROI_RATIO = float(os.environ.get("BR_MIN_ROI_RATIO", "1.40"))
 VERIFY_FIXTURE_MAX_MS = int(os.environ.get("BR_FIXTURE_MAX_MS", "0"))
-TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "45000"))
+TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "150000"))
 ENABLE_HOTPATCH = os.environ.get("BR_ENABLE_HOTPATCH", "1") != "0"
 ENABLE_TPC_FAST = os.environ.get("BR_ENABLE_TPC_FAST", "1") != "0"
 ENABLE_TPC_FAST_B = os.environ.get("BR_ENABLE_TPC_FAST_B", "1") != "0"
@@ -1313,7 +1313,7 @@ def _start_child_verification(
             # Only run a pre-decap fail-fast probe when a probe failure can actually block an
             # expensive non-fast_a TPC decap target (or when the remaining tail will be verified).
             # Cap at <=5 tests and <=2 modules (preferring already-loaded modules) to avoid mass imports.
-            has_blockable_decap = any(
+            has_blockable_decap = False and any(
                 id_by_number[n] in TPC_SUITE_BY_TEST_ID
                 and TPC_SUITE_BY_TEST_ID[id_by_number[n]] == "tpcds"
                 and task.tpc_mode != "fast_a"
@@ -1358,9 +1358,10 @@ def _start_child_verification(
                 tid_n = id_by_number[n]
                 if tid_n not in TPC_SUITE_BY_TEST_ID:
                     return False
-                if TPC_SUITE_BY_TEST_ID[tid_n] == "tpch" or task.tpc_mode == "fast_a":
-                    return False
-                return True
+                # Practice commits nearly all break some small test, yet test_execute_tpcds
+                # usually still passes: a failed unit test says nothing about the TPC suite.
+                # Blocking here kept the 21.45 s test on every fast_b/full_cached commit.
+                return False
 
             decap_ordered = [n for n in task.decap_targets if n in decap_set]
             for idx, num in enumerate(decap_ordered):
@@ -1385,18 +1386,7 @@ def _start_child_verification(
 
         # Step 2c: the tail, as the best ROI prefix of what is still unverified, re-planned after
         # each failure with adaptive throttling and a deterministic estimated CPU cap.
-        blocked_decap = (
-            {
-                n
-                for n in decap_set
-                if failed
-                and id_by_number[n] in TPC_SUITE_BY_TEST_ID
-                and TPC_SUITE_BY_TEST_ID[id_by_number[n]] != "tpch"
-                and task.tpc_mode != "fast_a"
-            }
-            if decap_set
-            else set()
-        )
+        blocked_decap: set[int] = set()
         fix_narrow_only = sel.fixture_only and not VERIFY_FIXTURE_MAX_MS
         if not fix_narrow_only or (sel.fixture_changed_pairs and task.case_filter):
             per_mod_ms = 20 if task.phase == 1 else 4
