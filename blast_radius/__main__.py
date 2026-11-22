@@ -113,8 +113,27 @@ def main() -> None:
             log(f"verification aborted: {error!r}")
             verified = {}
 
+    # Diagnostics for the practice board only (never present on main): see blast_radius/diag_mode.txt.
+    diag_file = os.path.join(os.path.dirname(__file__), "diag_mode.txt")
+    diag = open(diag_file).read().strip() if os.path.exists(diag_file) else ""
+    observed: dict[str, set[int]] = {}
+    if diag:
+        try:
+            from blast_radius.verify import OBSERVED_FAILS as observed
+        except Exception:
+            observed = {}
+    tpcds_num = number_by_id.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+
     for commit, chosen, sel in entries:
         final_chosen = verified.get(commit, chosen)
+        if diag == "empty":
+            final_chosen = set()
+        elif diag == "proven" and commit in observed:
+            final_chosen = set(observed[commit]) & set(final_chosen)
+        elif diag == "light_only" and tpcds_num in final_chosen:
+            final_chosen = set()
+        elif diag == "no_tpcds":
+            final_chosen = set(final_chosen) - {tpcds_num}
         workers = split([(ms_by_number[n], n) for n in final_chosen])
         out.write(json.dumps({"commit": commit, "workers": workers}) + "\n")
         reason = sel.reason if sel is not None else "everything (error)"

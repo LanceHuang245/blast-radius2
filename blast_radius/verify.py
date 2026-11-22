@@ -2038,6 +2038,10 @@ def _prewarm_for_phase2(
                     _install_block_filter(mod, getattr(mod, parts[1]), parts[2])
 
 
+# commit -> test numbers a verification child ran and saw fail (diagnostics only).
+OBSERVED_FAILS: dict[str, set[int]] = {}
+
+
 def _kill_group(pid: int) -> None:
     """SIGKILL the process group led by `pid` (the verification child and its subprocesses)."""
     try:
@@ -2100,6 +2104,7 @@ def _run_batch_parallel(
             f"pass={len(passed_set)} fail={len(failed_ids)}/{len(task.chosen)}{end} failed={failed_ids[:5]}"
         )
         verified[task.commit] = task.chosen - passed_set
+        OBSERVED_FAILS[task.commit] = {int(line[2:]) for line in lines if line.startswith(b"F ")}
 
     while queue or active:
         # Run 1 child at a time initially to avoid SMT cache contention (+0.7s CPU);
