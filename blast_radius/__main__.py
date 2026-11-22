@@ -123,6 +123,18 @@ def main() -> None:
         except Exception:
             observed = {}
     tpcds_num = number_by_id.get("tests/test_executor.py::TestExecutor::test_execute_tpcds")
+    heavy_nums = {
+        number_by_id.get(t)
+        for t in (
+            "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+            "tests/test_parser.py::TestParser::test_max_nodes",
+            "tests/test_generator.py::TestGenerator::test_generator_memory",
+            "tests/test_executor.py::TestExecutor::test_execute_tpch",
+            "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+            "tests/test_optimizer.py::TestOptimizer::test_scope",
+            "tests/test_optimizer.py::TestOptimizer::test_tpcds",
+        )
+    }
 
     for commit, chosen, sel in entries:
         final_chosen = verified.get(commit, chosen)
@@ -132,6 +144,10 @@ def main() -> None:
             final_chosen = set(observed[commit]) & set(final_chosen)
         elif diag == "light_only" and tpcds_num in final_chosen:
             final_chosen = set()
+        elif diag == "no_heavy":
+            final_chosen = set(final_chosen) - heavy_nums
+        elif diag == "no_max_nodes":
+            final_chosen = set(final_chosen) - {number_by_id.get("tests/test_parser.py::TestParser::test_max_nodes")}
         elif diag == "no_tpcds":
             final_chosen = set(final_chosen) - {tpcds_num}
         workers = split([(ms_by_number[n], n) for n in final_chosen])
