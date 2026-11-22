@@ -1179,7 +1179,7 @@ class Selector:
 
         # If every edited line actually lives inside a lambda body within the assignment,
         # let the normal lambda/statement coverage handle it (often even narrower).
-        if removed and all(old_scopes.lambda_at(n) is not None and old_scopes.lambda_at(n)[0] < n for n, _ in removed):
+        if removed and all(old_scopes.lambda_at(n) is not None and old_scopes.lambda_at(n)[2] < n for n, _ in removed):
             if all(new_scopes.lambda_at(n) is not None for n, _, _ in added):
                 return None
 
@@ -1614,7 +1614,7 @@ class Selector:
         span = scopes.lambda_at(lineno)
         if span is not None:
             mask = self.impact.span(path, span[0], span[1])
-            if lineno == span[0]:
+            if lineno <= span[2]:  # the header line: it also runs where the lambda is defined
                 mask |= self.container_level(path, module, scopes, lineno)
             elif self.runs_before_tests(path, span[0], span[1]):
                 self._spans_ok = False
@@ -1659,7 +1659,7 @@ class Selector:
         if new_scopes.lambda_at(new_lineno) is not None:
             for probe in (anchor - 1, anchor):
                 span = old_scopes.lambda_at(probe)
-                if span is not None and span[0] < probe <= span[1]:
+                if span is not None and span[2] < probe and span[0] <= probe <= span[1]:
                     if self.runs_before_tests(path, span[0], span[1]):
                         self._spans_ok = False
                     else:

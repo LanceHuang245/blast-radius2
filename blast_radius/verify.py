@@ -1197,7 +1197,7 @@ def _start_child_verification(
                 return True if lazy_load_ok is None and task.phase == 2 else bool(lazy_load_ok)
             if task.tpc_mode and tid in TPC_SUITE_BY_TEST_ID:
                 suite = TPC_SUITE_BY_TEST_ID[tid]
-                signal.alarm(90)
+                signal.alarm(120)
                 try:
                     return verify_tpc_test(
                         suite,

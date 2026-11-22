@@ -46,7 +46,7 @@ class Scopes:
         self.tree = tree
         self._has_lambda = has_lambda
         self.functions: list[tuple[int, int, int, str, ast.AST]] = []
-        self.lambdas: list[tuple[int, int]] = []
+        self.lambdas: list[tuple[int, int, int]] = []
         self.classes: list[tuple[int, int, str]] = []
         self.by_qualname: dict[str, list[tuple[int, int]]] = {}
         self.statements: list[tuple[int, int, ast.stmt]] = []
@@ -99,7 +99,9 @@ class Scopes:
                     self._walk(child, prefix)
             elif self._has_lambda:
                 if isinstance(child, ast.Lambda):
-                    self.lambdas.append((child.body.lineno, child.body.end_lineno))
+                    # (body start, body end, header line): a body line below the header only runs
+                    # when the lambda is called; the header line also runs where it is defined.
+                    self.lambdas.append((child.body.lineno, child.body.end_lineno, child.lineno))
                 self._walk(child, prefix)
             elif isinstance(child, (ast.ExceptHandler, ast.match_case)):
                 self._walk(child, prefix)
@@ -114,9 +116,9 @@ class Scopes:
 
     def lambda_at(self, lineno: int):
         best = None
-        for start, end in self.lambdas:
+        for start, end, head in self.lambdas:
             if start <= lineno <= end and (best is None or start >= best[0]):
-                best = (start, end)
+                best = (start, end, head)
         return best
 
     def class_at(self, lineno: int):

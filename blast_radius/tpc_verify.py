@@ -107,8 +107,8 @@ TPC_EST_CPU_MS = {
 # plans whose rows all match is still far cheaper than keeping it, and real breakage mostly shows
 # up in the first (cheapest) re-executed queries.
 TPC_REEXEC_MAX_QUERIES = int(os.environ.get("BR_TPC_REEXEC_MAX", "99"))
-TPC_REEXEC_EST_BUDGET_MS = int(os.environ.get("BR_TPC_REEXEC_EST_MS", "16000"))
-TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "24.0"))
+TPC_REEXEC_EST_BUDGET_MS = int(os.environ.get("BR_TPC_REEXEC_EST_MS", "20000"))
+TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "45.0"))
 TPC_DUCK_MAX_QUERIES = int(os.environ.get("BR_TPC_DUCK_MAX", "99"))
 TPC_DUCK_BUDGET_S = float(os.environ.get("BR_TPC_DUCK_BUDGET", "15.0"))
 
