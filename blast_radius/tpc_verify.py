@@ -1293,10 +1293,9 @@ def verify_tpcds_fixture_edit(old_text: str, new_text: str) -> bool:
     import pandas as pd
     from pandas.testing import assert_frame_equal
 
-    from sqlglot import parse_one, transpile
+    from sqlglot import find_tables, parse_one, transpile
     from sqlglot.executor import execute
     from sqlglot.executor.table import Table
-    from sqlglot import exp
 
     old = _fixture_pairs_like_test(old_text)
     new = _fixture_pairs_like_test(new_text)
@@ -1313,6 +1312,10 @@ def verify_tpcds_fixture_edit(old_text: str, new_text: str) -> bool:
 
     with open(TPC_S2_BLOBS_DIR / "tpcds" / "meta.pkl", "rb") as handle:
         schema_map = pickle.load(handle)["schema"]
+    meta_ms = load_tpcds_ckpts_meta()
+    q_ms = (meta_ms.get("s2b_query_ms") or {}).get("tpcds") if meta_ms else None
+    if q_ms is not None and len(q_ms) != len(old):
+        q_ms = None
     conn = duckdb.connect()
     made: set[str] = set()
     rows_cache: dict[str, list] = {}
@@ -1320,11 +1323,12 @@ def verify_tpcds_fixture_edit(old_text: str, new_text: str) -> bool:
         for i in todo:
             sql = new[i][1]
             expression = parse_one(sql)
-            names = {t.name for t in expression.find_all(exp.Table)}
+            # Exactly the tables mp_execute passes (a name the test cannot resolve fails it).
+            names = {t.name for t in find_tables(expression)}
+            if not names <= set(TPCDS_SCHEMA) or not names <= set(schema_map):
+                return False
             tables = {}
             for name in names:
-                if name not in schema_map or name not in TPCDS_SCHEMA:
-                    continue  # the test would raise KeyError: let execute() fail the same way
                 if name not in rows_cache:
                     with open(tpc_s2_table_file("tpcds", name), "rb") as handle:
                         rows_cache[name] = pickle.load(handle)
@@ -1336,7 +1340,13 @@ def verify_tpcds_fixture_edit(old_text: str, new_text: str) -> bool:
                         f"columns={TPCDS_SCHEMA[name]})"
                     )
                     made.add(name)
+            t0 = time.process_time()
             table = execute(expression, schema=schema_map, tables=tables)
+            spent_ms = (time.process_time() - t0) * 1000
+            # A query the edit made much slower can time out in the real run: unproven.
+            pinned_ms = q_ms[i] if q_ms and i < len(q_ms) else 0
+            if spent_ms > 3 * pinned_ms + 1000:
+                return False
             a = conn.execute(transpile(sql, write="duckdb")[0]).fetchdf()
             b = pd.DataFrame(((np.nan if c is None else c for c in r) for r in table.rows), columns=table.columns)
             assert_frame_equal(a, b, check_dtype=False, check_index_type=False)
