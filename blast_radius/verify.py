@@ -81,6 +81,9 @@ DECAP_CPU_RATIO = float(os.environ.get("BR_DECAP_CPU_RATIO", "0.75"))
 # (1.0: break-even on the score; below 1: spend CPU to cut simulated time further).
 CPU_WEIGHT = float(os.environ.get("BR_CPU_WEIGHT", "1.0"))
 PROFILE_TESTS = os.environ.get("BR_PROFILE_TESTS", "0") != "0"
+# Pre-import (in the parent) test modules that only ONE task needs: same CPU as importing it in
+# that child, and wasted when the child stops early. Modules shared by >= 2 tasks are still warmed.
+PREWARM_SINGLE = os.environ.get("BR_PREWARM_SINGLE", "0") != "0"
 CHILD_GC_THRESHOLD = int(os.environ.get("BR_CHILD_GC_THRESHOLD", "1000000"))
 ENABLE_TPC_FAST = os.environ.get("BR_ENABLE_TPC_FAST", "1") != "0"
 ENABLE_TPC_FAST_B = os.environ.get("BR_ENABLE_TPC_FAST_B", "1") != "0"
@@ -1127,12 +1130,7 @@ def _start_child_verification(
         sel = task.selection
         executor_patched = "tests/test_executor.py" in sel.patched_files
         needs_real_tpc = any(
-            (
-                id_by_number[n] in TPC_SUITE_BY_TEST_ID and not task.tpc_mode
-            )
-            or (
-                id_by_number[n] == OPT_TPCH_TEST_ID and not _can_fast_opt_tpch(sel)
-            )
+            _real_tpc_possible(task.tpc_mode, sel, n, id_by_number, ms_by_number, cpu_by_number)
             for n in task.chosen
         )
         if not executor_patched and not needs_real_tpc:
@@ -1990,11 +1988,11 @@ def _prewarm_for_phase2(
         ordered = sorted(verifiable, key=lambda n: (cpu_by_number[n], ms_by_number[n], id_by_number[n]))
         first_file = id_by_number[ordered[0]].split("::", 1)[0]
         first_mod = first_file[:-3].replace("/", ".")
-        if first_mod != "tests.test_executor":
+        if PREWARM_SINGLE and first_mod != "tests.test_executor":
             needed_mods.add(first_mod)
         for num in task.decap_targets:
             dmod = id_by_number[num].split("::", 1)[0][:-3].replace("/", ".")
-            if dmod != "tests.test_executor":
+            if PREWARM_SINGLE and dmod != "tests.test_executor":
                 needed_mods.add(dmod)
         task_mods = {id_by_number[n].split("::", 1)[0][:-3].replace("/", ".") for n in verifiable}
         for mod in task_mods:
@@ -2009,8 +2007,7 @@ def _prewarm_for_phase2(
     lazy_data_ok = not any(
         "tests/test_executor.py" in t.selection.patched_files
         or any(
-            (id_by_number[n] in TPC_SUITE_BY_TEST_ID and not t.tpc_mode)
-            or (id_by_number[n] == OPT_TPCH_TEST_ID and not _can_fast_opt_tpch(t.selection))
+            _real_tpc_possible(t.tpc_mode, t.selection, n, id_by_number, ms_by_number, cpu_by_number)
             for n in t.chosen
         )
         for t in phase2_tasks
@@ -2051,6 +2048,21 @@ def _prewarm_for_phase2(
                 mod = sys.modules.get(mod_name)
                 if mod is not None and hasattr(mod, parts[1]):
                     _install_block_filter(mod, getattr(mod, parts[1]), parts[2])
+
+
+def _real_tpc_possible(task_tpc_mode, sel, n: int, id_by_number, ms_by_number, cpu_by_number) -> bool:
+    """True iff the TPC test `n` could be run for real (real numpy/pandas/DuckDB data) in a child.
+
+    A test the planner prices above its own simulated time can never be a profitable
+    verification target, so it is never run: its presence in `chosen` needs no real data libs.
+    (If it ever ran under lazy stubs it would fail, i.e. stay selected: never a miss.)"""
+    tid = id_by_number[n]
+    needs = (tid in TPC_SUITE_BY_TEST_ID and not task_tpc_mode) or (
+        tid == OPT_TPCH_TEST_ID and not _can_fast_opt_tpch(sel)
+    )
+    if not needs:
+        return False
+    return cpu_by_number[n] * MIN_ROI_RATIO * CPU_WEIGHT < ms_by_number[n]
 
 
 def _kill_group(pid: int) -> None:
@@ -2224,8 +2236,7 @@ def verify_batches(
         for n in t.chosen
     )
     needs_real_tpc = any(
-        (id_by_number[n] in TPC_SUITE_BY_TEST_ID and not t.tpc_mode)
-        or (id_by_number[n] == OPT_TPCH_TEST_ID and not _can_fast_opt_tpch(t.selection))
+        _real_tpc_possible(t.tpc_mode, t.selection, n, id_by_number, ms_by_number, cpu_by_number)
         for t in all_tasks
         for n in t.chosen
     )
