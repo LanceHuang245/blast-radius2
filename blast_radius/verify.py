@@ -892,8 +892,10 @@ def _special_cpu_ms(
         return 400
     if tid == GEN_MEM_TEST_ID:
         can_fast, is_scoped = _can_fast_gen_mem(sel)
-        if can_fast and is_scoped:
-            return 550
+        if can_fast:
+            # Scoped: only the affected dialects. Core edits: every dialect (the real test),
+            # measured ~0.4 s on a frozen heap; margin for a slower host.
+            return 550 if is_scoped else 1500
     return None
 
 

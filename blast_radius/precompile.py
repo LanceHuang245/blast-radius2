@@ -397,7 +397,8 @@ def main() -> None:
     raw["pinned_identifiers"] = sorted(pinned_ids)
     raw["leaf_classes"] = _leaf_sqlglot_classes()
     cal = _calibrate_and_update_tpc_meta(SOURCE, raw["tests"])
-    cal["tests/test_generator.py::TestGenerator::test_generator_memory"] = 18400
+    # Real cost on a frozen heap (as verification children run) is ~0.4 s; keep a safety margin.
+    cal["tests/test_generator.py::TestGenerator::test_generator_memory"] = 1500
     cal["tests/dialects/test_dialect.py::TestDialect::test_lazy_load"] = 5
     raw["real_cpu_ms"] = cal
 
