@@ -38,7 +38,9 @@ def _run_fixture_check(patched_files: dict, limit_s: float = 45.0) -> set[str]:
                 verify_tpch_fixture_edit,
             )
 
-            if TPCDS_FIXTURE in patched_files:
+            # The tpc-ds fixture proof passed on a practice commit where test_execute_tpcds really
+            # fails (cause not reproduced locally): disabled. tpc-h proofs stay (local labels agree).
+            if False and TPCDS_FIXTURE in patched_files:
                 old_text = (SOURCE / TPCDS_FIXTURE).read_text(encoding="utf-8")
                 if verify_tpcds_fixture_edit(old_text, patched_files[TPCDS_FIXTURE]):
                     proven.add("tests/test_executor.py::TestExecutor::test_execute_tpcds")
