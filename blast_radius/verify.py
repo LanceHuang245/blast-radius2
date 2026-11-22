@@ -62,24 +62,24 @@ from blast_radius.tpc_verify import (
 )
 
 # Decision thresholds (overridable via env vars for local A/B benchmarking).
-MAX_SINGLE_TEST_MS = int(os.environ.get("BR_MAX_SINGLE_MS", "6000"))
-MAX_COMMIT_VERIFY_MS = int(os.environ.get("BR_MAX_COMMIT_MS", "6000"))
+MAX_SINGLE_TEST_MS = int(os.environ.get("BR_MAX_SINGLE_MS", "30000"))
+MAX_COMMIT_VERIFY_MS = int(os.environ.get("BR_MAX_COMMIT_MS", "120000"))
 MIN_GAIN_MS = int(os.environ.get("BR_MIN_GAIN_MS", "300"))
 MIN_DECAP_GAIN_MS = int(os.environ.get("BR_MIN_DECAP_GAIN_MS", "550"))
 MIN_ROI_RATIO = float(os.environ.get("BR_MIN_ROI_RATIO", "1.40"))
 VERIFY_FIXTURE_MAX_MS = int(os.environ.get("BR_FIXTURE_MAX_MS", "0"))
-TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "150000"))
+TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "400000"))
 ENABLE_HOTPATCH = os.environ.get("BR_ENABLE_HOTPATCH", "1") != "0"
 # Tail verification (Step 2c) limits: how much CPU a child may spend dropping passing tests.
-STEP2C_ROUNDS = int(os.environ.get("BR_STEP2C_ROUNDS", "5"))
-STEP2C_EST_CAP_MS = int(os.environ.get("BR_STEP2C_EST_MS", "5000"))
-STEP2C_CPU_S = float(os.environ.get("BR_STEP2C_CPU_S", "12.0"))
-STEP2C_FAIL_ROI = float(os.environ.get("BR_STEP2C_FAIL_ROI", "2.5"))
-STEP2C_KEEP_AFTER_FAIL = os.environ.get("BR_STEP2C_KEEP_AFTER_FAIL", "0") != "0"
-DECAP_CPU_RATIO = float(os.environ.get("BR_DECAP_CPU_RATIO", "0.75"))
+STEP2C_ROUNDS = int(os.environ.get("BR_STEP2C_ROUNDS", "40"))
+STEP2C_EST_CAP_MS = int(os.environ.get("BR_STEP2C_EST_MS", "120000"))
+STEP2C_CPU_S = float(os.environ.get("BR_STEP2C_CPU_S", "60.0"))
+STEP2C_FAIL_ROI = float(os.environ.get("BR_STEP2C_FAIL_ROI", "1.0"))
+STEP2C_KEEP_AFTER_FAIL = os.environ.get("BR_STEP2C_KEEP_AFTER_FAIL", "1") != "0"
+DECAP_CPU_RATIO = float(os.environ.get("BR_DECAP_CPU_RATIO", "5"))
 # Weight of a CPU millisecond against a simulated millisecond when choosing what to verify
 # (1.0: break-even on the score; below 1: spend CPU to cut simulated time further).
-CPU_WEIGHT = float(os.environ.get("BR_CPU_WEIGHT", "1.0"))
+CPU_WEIGHT = float(os.environ.get("BR_CPU_WEIGHT", "0.5"))
 ENABLE_TPC_FAST = os.environ.get("BR_ENABLE_TPC_FAST", "1") != "0"
 ENABLE_TPC_FAST_B = os.environ.get("BR_ENABLE_TPC_FAST_B", "1") != "0"
 TPC_PROBE_BUDGET_MS = int(os.environ.get("BR_TPC_PROBE_MS", "300"))
